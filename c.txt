@@ -1,11 +1,42 @@
-Nos logs da execução, o método de fallback (listener page.on("response") / context.on("response") filtrando por PDF/URL do showjasperreportpdfservlet) capturou corretamente o binário do PDF ("Binário do PDF capturado via evento de rede"). Porém, o método "principal" (fazer uma requisição manual separada com context.request.get(url_do_frame)) falhou e retornou o frameset HTML de erro do Oracle ADF (_AdfWindowOpenError), pois esse servidor valida que a requisição venha de uma navegação real de frame dentro da sessão (referer, viewstate, nome da janela _afrWindowId), e uma requisição solta via context.request.get não carrega esse contexto.
+Confirmei via debug que o listener `context.on("response", ...)` funciona (capturou uma resposta real), mas **nenhum evento de resposta é disparado quando o PDF é efetivamente renderizado no popup** — mesmo o PDF aparecendo visualmente na tela. Isso é um comportamento conhecido do Chromium: quando uma página navega para uma URL de PDF e ele é exibido no visualizador nativo interno (MimeHandlerView), o evento `response` de rede às vezes não é disparado de forma confiável para o Playwright via CDP.
 
-Preciso que você refatore a lógica para:
+Preciso que você mude a estratégia de captura para usar o mecanismo de **download nativo do Playwright**, que é o correto para esse cenário:
 
-Remover completamente a tentativa de requisição manual via context.request.get() — ela sempre vai falhar nesse sistema ADF.
-Usar exclusivamente o listener de rede como método principal (não mais como fallback): registre page.on("response") (ou no context, cobrindo todas as páginas/popups) antes de clicar em "Exportar Imagens", filtrando por content-type: application/pdf OU por URL contendo showjasperreportpdfservlet.
-Ao capturar essa resposta, validar o conteúdo com response.body().startswith(b"%PDF") antes de salvar, para garantir que não é HTML de erro disfarçado.
-Salvar o binário validado direto em disco, sem nenhuma etapa intermediária de extrair src de frame e refazer requisição.
-Adicionar um timeout generoso de espera pelo evento de resposta (documentos de até 600 páginas podem demorar para o servidor gerar), com uma mensagem clara no console se o timeout expirar sem captura.
+1. Ao criar o `context` do navegador, adicione as seguintes preferências para forçar o Chromium/Edge a **nunca abrir PDFs no visualizador nativo**, sempre tratando como download:
+```python
+context = browser.new_context(
+    accept_downloads=True,
+    ignore_https_errors=True,
+)
+```
+Como o Playwright não expõe diretamente as `prefs` do Chrome/Edge via `new_context`, ao invés disso configure o `launch()` do navegador para usar um `user_data_dir` persistente com as prefs certas, OU (alternativa mais simples) registre um listener de `download` na página do popup, que o Playwright dispara automaticamente sempre que uma navegação resulta em download — o que geralmente ocorre até mesmo quando o servidor manda `Content-Disposition: inline`, dependendo da configuração do navegador.
 
-Mantenha absolutamente todo o restante do fluxo (login, verificação por e-mail, seleção de agência/transações) inalterado — o ajuste é só nessa etapa final de captura do PDF.
+2. Substitua a lógica atual de captura via `response` por uma abordagem baseada em `expect_download()`:
+```python
+print("Clicando em Exportar Imagens de forma forçada...")
+with context.expect_page(timeout=180000) as new_page_info:
+    dialog_frame.locator(seletor_btn2).click(force=True, delay=150)
+
+popup_page = new_page_info.value
+print("Janela pop-up detectada com sucesso.")
+
+try:
+    with popup_page.expect_download(timeout=1200000) as download_info:
+        # Aguarda o download ser disparado pela navegação/renderização do PDF dentro do popup
+        popup_page.wait_for_load_state("networkidle", timeout=1200000)
+    download = download_info.value
+    download.save_as(nome_arquivo)
+    print(f"[SUCESSO] PDF salvo via evento de download em: {nome_arquivo}")
+except Exception as e:
+    print(f"[AVISO] Nenhum download automático disparado: {e}")
+    print("[FALLBACK] Tentando capturar via resposta de rede como método secundário...")
+    # Mantenha aqui o código antigo de response listener como fallback
+```
+
+3. Mantenha o listener de `response` como fallback secundário (não remova), mas priorize o `expect_download()` como método principal agora, já que os testes mostraram que o evento de response não é confiável para esse fluxo específico de renderização de PDF no popup.
+
+Não altere nada do fluxo de login, seleção de agência/transações — o ajuste é só na etapa final de captura.
+
+---
+
+Esse caminho tende a resolver porque contorna exatamente a limitação que os testes acabaram de confirmar.
