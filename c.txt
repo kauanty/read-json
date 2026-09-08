@@ -1,0 +1,17 @@
+Estou automatizando com Playwright (Python, usando channel="msedge") a extração de PDFs de um sistema corporativo em Oracle ADF Faces (JSF). O fluxo de login, verificação por e-mail e seleção de transações já funciona e não deve ser alterado — o problema está isolado na etapa final de extração do PDF.
+
+Diagnóstico do problema: ao clicar em "Extrair PDF", o ADF abre uma nova janela/popup contendo um frameset HTML, não o PDF diretamente. Esse frameset tem um <frame> interno cujo src aponta para um endpoint JasperReports, no formato:
+
+/JDoc/faces/showjasperreportpdfservlet?_rtrnId=<ID>&_afrPage=<PAGE>
+
+É esse frame interno que efetivamente retorna o PDF binário (Content-Type: application/pdf). Minha automação está atualmente capturando/salvando o conteúdo da janela externa (o frameset), e por isso o arquivo salvo é HTML disfarçado de PDF — por isso aparece corrompido e dá erro relacionado a JavaScript ao abrir.
+
+O que preciso que você implemente, sem alterar o restante do fluxo:
+
+Depois do clique em "Extrair PDF", capture a nova página/popup com context.expect_page().
+Nessa nova página, localize o elemento <frame> (ou <iframe>) filho e extraia seu atributo src (a URL do showjasperreportpdfservlet).
+Usando o mesmo context do Playwright (para manter cookies/sessão autenticada), faça uma requisição a essa URL — de preferência usando context.request.get(url) do Playwright (que reaproveita a sessão automaticamente), e salve o response.body() como PDF em disco.
+Como alternativa/fallback, escute page.on("response") (ou new_page.on("response")) filtrando por content-type: application/pdf OU por URL contendo showjasperreportpdfservlet, e salve o body dessa resposta específica — isso evita depender de localizar o elemento <frame> no DOM.
+Nomeie o arquivo salvo de forma identificável (ex: com base no ID da agência e timestamp).
+
+Não altere nada do login, verificação por e-mail, ou seleção de transações — o ajuste deve ficar restrito à etapa de extração/download do PDF final, considerando que o sistema é Oracle ADF e o PDF real vem de dentro de um frame interno do popup, não da página externa.
