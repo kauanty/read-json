@@ -1,17 +1,11 @@
-Estou automatizando com Playwright (Python, usando channel="msedge") a extração de PDFs de um sistema corporativo em Oracle ADF Faces (JSF). O fluxo de login, verificação por e-mail e seleção de transações já funciona e não deve ser alterado — o problema está isolado na etapa final de extração do PDF.
+Nos logs da execução, o método de fallback (listener page.on("response") / context.on("response") filtrando por PDF/URL do showjasperreportpdfservlet) capturou corretamente o binário do PDF ("Binário do PDF capturado via evento de rede"). Porém, o método "principal" (fazer uma requisição manual separada com context.request.get(url_do_frame)) falhou e retornou o frameset HTML de erro do Oracle ADF (_AdfWindowOpenError), pois esse servidor valida que a requisição venha de uma navegação real de frame dentro da sessão (referer, viewstate, nome da janela _afrWindowId), e uma requisição solta via context.request.get não carrega esse contexto.
 
-Diagnóstico do problema: ao clicar em "Extrair PDF", o ADF abre uma nova janela/popup contendo um frameset HTML, não o PDF diretamente. Esse frameset tem um <frame> interno cujo src aponta para um endpoint JasperReports, no formato:
+Preciso que você refatore a lógica para:
 
-/JDoc/faces/showjasperreportpdfservlet?_rtrnId=<ID>&_afrPage=<PAGE>
+Remover completamente a tentativa de requisição manual via context.request.get() — ela sempre vai falhar nesse sistema ADF.
+Usar exclusivamente o listener de rede como método principal (não mais como fallback): registre page.on("response") (ou no context, cobrindo todas as páginas/popups) antes de clicar em "Exportar Imagens", filtrando por content-type: application/pdf OU por URL contendo showjasperreportpdfservlet.
+Ao capturar essa resposta, validar o conteúdo com response.body().startswith(b"%PDF") antes de salvar, para garantir que não é HTML de erro disfarçado.
+Salvar o binário validado direto em disco, sem nenhuma etapa intermediária de extrair src de frame e refazer requisição.
+Adicionar um timeout generoso de espera pelo evento de resposta (documentos de até 600 páginas podem demorar para o servidor gerar), com uma mensagem clara no console se o timeout expirar sem captura.
 
-É esse frame interno que efetivamente retorna o PDF binário (Content-Type: application/pdf). Minha automação está atualmente capturando/salvando o conteúdo da janela externa (o frameset), e por isso o arquivo salvo é HTML disfarçado de PDF — por isso aparece corrompido e dá erro relacionado a JavaScript ao abrir.
-
-O que preciso que você implemente, sem alterar o restante do fluxo:
-
-Depois do clique em "Extrair PDF", capture a nova página/popup com context.expect_page().
-Nessa nova página, localize o elemento <frame> (ou <iframe>) filho e extraia seu atributo src (a URL do showjasperreportpdfservlet).
-Usando o mesmo context do Playwright (para manter cookies/sessão autenticada), faça uma requisição a essa URL — de preferência usando context.request.get(url) do Playwright (que reaproveita a sessão automaticamente), e salve o response.body() como PDF em disco.
-Como alternativa/fallback, escute page.on("response") (ou new_page.on("response")) filtrando por content-type: application/pdf OU por URL contendo showjasperreportpdfservlet, e salve o body dessa resposta específica — isso evita depender de localizar o elemento <frame> no DOM.
-Nomeie o arquivo salvo de forma identificável (ex: com base no ID da agência e timestamp).
-
-Não altere nada do login, verificação por e-mail, ou seleção de transações — o ajuste deve ficar restrito à etapa de extração/download do PDF final, considerando que o sistema é Oracle ADF e o PDF real vem de dentro de um frame interno do popup, não da página externa.
+Mantenha absolutamente todo o restante do fluxo (login, verificação por e-mail, seleção de agência/transações) inalterado — o ajuste é só nessa etapa final de captura do PDF.
