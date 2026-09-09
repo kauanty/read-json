@@ -1,42 +1,36 @@
-Confirmei via debug que o listener `context.on("response", ...)` funciona (capturou uma resposta real), mas **nenhum evento de resposta é disparado quando o PDF é efetivamente renderizado no popup** — mesmo o PDF aparecendo visualmente na tela. Isso é um comportamento conhecido do Chromium: quando uma página navega para uma URL de PDF e ele é exibido no visualizador nativo interno (MimeHandlerView), o evento `response` de rede às vezes não é disparado de forma confiável para o Playwright via CDP.
 
-Preciso que você mude a estratégia de captura para usar o mecanismo de **download nativo do Playwright**, que é o correto para esse cenário:
 
-1. Ao criar o `context` do navegador, adicione as seguintes preferências para forçar o Chromium/Edge a **nunca abrir PDFs no visualizador nativo**, sempre tratando como download:
+Já tentei capturar o PDF via `context.on("response", ...)` e confirmei com debug que o listener funciona, mas nenhum evento de resposta chega quando o PDF real é renderizado no popup — provavelmente porque o Chromium está processando a resposta através do visualizador PDF nativo (PDFium), que intercepta o conteúdo antes dele virar um evento de rede visível ao Playwright.
+
+Preciso mudar a estratégia para **interceptação de rota (`route`)**, que atua numa camada anterior à renderização e deve conseguir capturar o binário antes do navegador "engolir" a resposta no visualizador.
+
+Implemente o seguinte, substituindo a lógica atual de captura via `response`:
+
 ```python
-context = browser.new_context(
-    accept_downloads=True,
-    ignore_https_errors=True,
-)
-```
-Como o Playwright não expõe diretamente as `prefs` do Chrome/Edge via `new_context`, ao invés disso configure o `launch()` do navegador para usar um `user_data_dir` persistente com as prefs certas, OU (alternativa mais simples) registre um listener de `download` na página do popup, que o Playwright dispara automaticamente sempre que uma navegação resulta em download — o que geralmente ocorre até mesmo quando o servidor manda `Content-Disposition: inline`, dependendo da configuração do navegador.
+pdf_bytes_capturados = None
 
-2. Substitua a lógica atual de captura via `response` por uma abordagem baseada em `expect_download()`:
-```python
-print("Clicando em Exportar Imagens de forma forçada...")
-with context.expect_page(timeout=180000) as new_page_info:
-    dialog_frame.locator(seletor_btn2).click(force=True, delay=150)
+def interceptar_rota_pdf(route):
+    nonlocal pdf_bytes_capturados
+    url = route.request.url.lower()
+    if "showjasperreportpdfservlet" in url or route.request.resource_type == "document":
+        try:
+            response = route.fetch()
+            content_type = response.headers.get("content-type", "").lower()
+            corpo = response.body()
+            if "application/pdf" in content_type or corpo.startswith(b"%PDF"):
+                pdf_bytes_capturados = corpo
+                print(f"[SUCESSO ROTA] PDF capturado via interceptação de rota: {url[:120]}...")
+            route.fulfill(response=response)
+        except Exception as e:
+            print(f"[ERRO ROTA] Falha ao interceptar: {e}")
+            route.continue_()
+    else:
+        route.continue_()
 
-popup_page = new_page_info.value
-print("Janela pop-up detectada com sucesso.")
-
-try:
-    with popup_page.expect_download(timeout=1200000) as download_info:
-        # Aguarda o download ser disparado pela navegação/renderização do PDF dentro do popup
-        popup_page.wait_for_load_state("networkidle", timeout=1200000)
-    download = download_info.value
-    download.save_as(nome_arquivo)
-    print(f"[SUCESSO] PDF salvo via evento de download em: {nome_arquivo}")
-except Exception as e:
-    print(f"[AVISO] Nenhum download automático disparado: {e}")
-    print("[FALLBACK] Tentando capturar via resposta de rede como método secundário...")
-    # Mantenha aqui o código antigo de response listener como fallback
+# Registrar a rota no CONTEXT inteiro, ANTES do clique
+context.route("**/*", interceptar_rota_pdf)
 ```
 
-3. Mantenha o listener de `response` como fallback secundário (não remova), mas priorize o `expect_download()` como método principal agora, já que os testes mostraram que o evento de response não é confiável para esse fluxo específico de renderização de PDF no popup.
+Depois de registrar essa rota (antes do clique em "Exportar Imagens"), mantenha o restante do fluxo de clique/detecção de popup como está. Ao final, adicione `context.unroute("**/*", interceptar_rota_pdf)` na limpeza, junto com a remoção do listener de response existente (pode manter o response listener como fallback secundário, não precisa remover).
 
-Não altere nada do fluxo de login, seleção de agência/transações — o ajuste é só na etapa final de captura.
-
----
-
-Esse caminho tende a resolver porque contorna exatamente a limitação que os testes acabaram de confirmar.
+Ajuste o loop de espera (`while pdf_bytes_capturados is None`) para continuar funcionando com essa nova variável, sem alterar o restante da lógica de login, seleção de agência ou nome do arquivo.
