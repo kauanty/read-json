@@ -1,28 +1,21 @@
-"""Diagnostico de uma exportacao SBK. Nao salva copia final nem valida o PDF.
-
-Mantem o login manual e os seletores do app.py recebido. Observa metadados,
-sem route.fetch(), repetir URLs, ler corpos HTTP ou gravar credenciais.
-"""
-
 from __future__ import annotations
 
 import argparse
+import asyncio
+from collections import Counter
+from contextlib import suppress
 from datetime import datetime
 from importlib.metadata import version
 import json
+import os
 from pathlib import Path
 import re
 import sys
 import time
-import tkinter as tk
-from tkinter import ttk
 from urllib.parse import urljoin, urlsplit
 
 from dotenv import dotenv_values
-from playwright.sync_api import Error as PlaywrightErro
-from playwright.sync_api import TimeoutError as PlaywrightTimeout
-from playwright.sync_api import sync_playwright
-
+from playwright.async_api import Error as PlaywrightErro, async_playwright
 
 class ConfiguracaoErro(ValueError):
     pass
@@ -118,387 +111,644 @@ def mime(value):
     return value if value in permitidos else ("outro" if value else "ausente")
 
 
-class Coletor:
-    def __init__(self, log_path: Path):
-        # Modo exclusivo: um log anterior nunca e sobrescrito.
-        self.arquivo = log_path.open("x", encoding="utf-8", buffering=1)
+
+"""Validação estrutural conservadora de um PDF já salvo em disco.
+
+Não reescreve o documento, não renderiza e não chama get_data()/get_contents().
+O pypdf pode ler bytes brutos de streams e decodificar estruturas internas
+(por exemplo object streams) necessárias ao parser; conteúdo visual não é
+interpretado. Streams comuns são descartados do cache após conferir seus
+metadados; o pico ainda depende do maior stream e dos object streams/xref
+internos, além dos metadados. Não há limite constante de RAM garantido.
+Leituras integrais sem tamanho explícito são bloqueadas: o validador rejeita
+documentos que levem o parser a esse caminho de reparo, mesmo se um visualizador
+conseguir abri-los.
+Uma estrutura válida não prova que o relatório contém todos os
+registros. A contagem esperada, quando conhecida externamente, acrescenta uma
+verificação de completude por número de páginas, sem validar seu conteúdo.
+"""
+
+import hashlib
+import logging
+import os
+import warnings
+from pathlib import Path
+
+from pypdf import PdfReader
+from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject, StreamObject
+
+
+class DocumentoInvalido(ValueError):
+    """Falha de validação; as mensagens não incluem caminhos ou dados do PDF."""
+
+
+class _ArquivoPdfLimitado:
+    """Arquivo em disco com seek; bloqueia fallback de leitura integral.
+
+    pypdf 6.10 pode usar read(-1) para procurar referências durante reparos,
+    inclusive em strict=True. Leituras normais com tamanho positivo continuam
+    disponíveis, inclusive streams individuais e estruturas internas grandes.
+    """
+    mode = "rb"
+
+    def __init__(self, arquivo):
+        self._arquivo = arquivo
+
+    def read(self, tamanho=-1):
+        if tamanho is None or tamanho < 0:
+            raise DocumentoInvalido("PDF exige leitura integral ou reparo não permitido.")
+        return self._arquivo.read(tamanho)
+
+    def seek(self, deslocamento, origem=0):
+        return self._arquivo.seek(deslocamento, origem)
+
+    def tell(self):
+        return self._arquivo.tell()
+
+
+class _AvisosPdf(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.ocorreu = False
+
+    def emit(self, record):
+        self.ocorreu = True
+        # Interrompe antes de propagar a mensagem original ao logger da aplicação.
+        # O texto do parser pode incluir fragmentos do documento.
+        raise DocumentoInvalido("PDF gerou avisos ou exigiu reparos de estrutura.")
+
+
+def _objeto_pdf(objeto):
+    return objeto.get_object() if isinstance(objeto, IndirectObject) else objeto
+
+
+def _verificar_arvore_paginas(raiz_paginas):
+    """Confere tipos, folhas únicas e /Count de cada nó da árvore."""
+    pendentes = [(_objeto_pdf(raiz_paginas), False)]
+    vistos = set()
+    contagens = {}
+    while pendentes:
+        no, concluir = pendentes.pop()
+        if not isinstance(no, DictionaryObject) or isinstance(no, StreamObject):
+            raise DocumentoInvalido("Árvore de páginas inválida.")
+        chave = id(no)
+        tipo = no.get("/Type")
+        if concluir:
+            filhos = _objeto_pdf(no.get("/Kids"))
+            total = sum(contagens[id(_objeto_pdf(filho))] for filho in filhos)
+            declarado = _objeto_pdf(no.get("/Count"))
+            if isinstance(declarado, bool) or not isinstance(declarado, int) or declarado != total:
+                raise DocumentoInvalido("Contagem interna de páginas inconsistente.")
+            contagens[chave] = total
+            continue
+        if chave in vistos:
+            raise DocumentoInvalido("Árvore de páginas inválida.")
+        vistos.add(chave)
+        if tipo == "/Page":
+            contagens[chave] = 1
+        elif tipo == "/Pages":
+            filhos = _objeto_pdf(no.get("/Kids"))
+            if not isinstance(filhos, ArrayObject):
+                raise DocumentoInvalido("Árvore de páginas inválida.")
+            pendentes.append((no, True))
+            pendentes.extend((_objeto_pdf(filho), False) for filho in reversed(filhos))
+        else:
+            raise DocumentoInvalido("Árvore de páginas inválida.")
+    return contagens[id(_objeto_pdf(raiz_paginas))]
+
+
+def _percorrer_estrutura_pdf(leitor):
+    """Resolve referências alcançáveis sem decodificar streams de conteúdo.
+
+    Inclui catálogo, metadados, páginas, recursos e anotações. Não percorre
+    objetos órfãos da tabela xref nem interpreta operadores de desenho, fontes,
+    imagens, assinaturas digitais ou o significado dos dados do relatório.
+    Depois de enfileirar os metadados de cada stream comum, remove apenas esse
+    stream do cache do leitor. Não altera bytes nem dicionários do documento.
+    /ObjStm e /XRef permanecem sob controle do parser; podem reter bytes brutos
+    e decodificados. Os dicionários/arrays de metadados permanecem retidos para
+    evitar reuso de identidades durante a travessia e preservar referências.
+    """
+    pendentes = [leitor.trailer]
+    referencias = set()
+    objetos = {}
+    while pendentes:
+        objeto = pendentes.pop()
+        referencia = None
+        if isinstance(objeto, IndirectObject):
+            chave = (objeto.idnum, objeto.generation)
+            if chave in referencias:
+                continue
+            referencias.add(chave)
+            referencia = objeto
+            objeto = objeto.get_object()
+        if isinstance(objeto, StreamObject):
+            if referencia is None:
+                # A especificação exige que streams sejam objetos indiretos.
+                # Um stream direto ficaria retido no dicionário do pai.
+                raise DocumentoInvalido("Stream PDF com referência inválida.")
+            pendentes.extend(objeto.values())
+            if objeto.get("/Type") not in ("/ObjStm", "/XRef"):
+                chave_cache = (referencia.generation, referencia.idnum)
+                if leitor.resolved_objects.get(chave_cache) is objeto:
+                    del leitor.resolved_objects[chave_cache]
+                # Libera antes de resolver o próximo stream, evitando sobrepor
+                # dois conteúdos pela variável local da iteração anterior.
+                objeto = None
+            continue
+        if isinstance(objeto, (DictionaryObject, ArrayObject)):
+            chave = id(objeto)
+            if chave in objetos:
+                continue
+            objetos[chave] = objeto
+            if isinstance(objeto, DictionaryObject):
+                # values() mantém referências indiretas; __getitem__ as resolveria.
+                # StreamObject é um dicionário: seus bytes não são decodificados.
+                pendentes.extend(objeto.values())
+            else:
+                pendentes.extend(objeto)
+
+
+def validar_pdf(path: Path, paginas_esperadas: int | None = None) -> dict:
+    """Retorna bytes, páginas e SHA-256 do arquivo original após validação.
+
+    Rejeita criptografia, avisos/reparos do parser, referências alcançáveis
+    inválidas, contagens incoerentes e ausência de assinatura/EOF. Sem uma
+    contagem esperada obtida de fonte confiável, não confirma que todas as
+    páginas pretendidas pelo sistema foram geradas ou transferidas.
+    """
+    if paginas_esperadas is not None and (
+        isinstance(paginas_esperadas, bool)
+        or not isinstance(paginas_esperadas, int)
+        or paginas_esperadas <= 0
+    ):
+        raise DocumentoInvalido("Contagem esperada de páginas inválida.")
+    avisos = _AvisosPdf()
+    logger = logging.getLogger("pypdf")
+    try:
+        with Path(path).open("rb") as arquivo:
+            estado_inicial = os.fstat(arquivo.fileno())
+            tamanho = estado_inicial.st_size
+            if arquivo.read(5) != b"%PDF-":
+                raise DocumentoInvalido("Assinatura PDF ausente.")
+            arquivo.seek(max(0, tamanho - 4096))
+            cauda = arquivo.read(4096).rstrip(b" \t\r\n\f\x00")
+            if not cauda.endswith(b"%%EOF"):
+                raise DocumentoInvalido("Marcador final PDF ausente ou inválido.")
+            arquivo.seek(0)
+            logger.addHandler(avisos)
+            try:
+                with warnings.catch_warnings(record=True) as avisos_python:
+                    warnings.simplefilter("always")
+                    leitor = PdfReader(_ArquivoPdfLimitado(arquivo), strict=True)
+                    if leitor.is_encrypted:
+                        raise DocumentoInvalido("PDF criptografado não é aceito.")
+                    raiz = _objeto_pdf(leitor.trailer.get("/Root"))
+                    if not isinstance(raiz, DictionaryObject) or isinstance(raiz, StreamObject) or raiz.get("/Type") != "/Catalog":
+                        raise DocumentoInvalido("Catálogo PDF inválido.")
+                    raiz_paginas = _objeto_pdf(raiz.get("/Pages"))
+                    if not isinstance(raiz_paginas, DictionaryObject) or isinstance(raiz_paginas, StreamObject) or raiz_paginas.get("/Type") != "/Pages":
+                        raise DocumentoInvalido("Árvore de páginas inválida.")
+                    paginas = _verificar_arvore_paginas(raiz_paginas)
+                    if paginas <= 0 or len(leitor.pages) != paginas:
+                        raise DocumentoInvalido("Contagem interna de páginas inconsistente.")
+                    _percorrer_estrutura_pdf(leitor)
+                    if avisos.ocorreu or avisos_python:
+                        raise DocumentoInvalido("PDF gerou avisos ou exigiu reparos de estrutura.")
+            finally:
+                logger.removeHandler(avisos)
+            if paginas_esperadas is not None and paginas != paginas_esperadas:
+                raise DocumentoInvalido("PDF com quantidade de páginas diferente da esperada.")
+            arquivo.seek(0)
+            digest = hashlib.sha256()
+            while bloco := arquivo.read(1024 * 1024):
+                digest.update(bloco)
+            estado_final = os.fstat(arquivo.fileno())
+            if (estado_final.st_size, estado_final.st_mtime_ns) != (
+                estado_inicial.st_size, estado_inicial.st_mtime_ns
+            ):
+                raise DocumentoInvalido("Arquivo alterado durante a validação.")
+            return {"bytes": tamanho, "paginas": paginas, "sha256": digest.hexdigest()}
+    except DocumentoInvalido:
+        raise
+    except Exception:
+        raise DocumentoInvalido("PDF inválido ou estrutura inconsistente.") from None
+
+
+class Monitor:
+    """Observacao manual; downloads nativos sao preservados antes de fechar."""
+
+    def __init__(self, pasta, timeout_download=1200, paginas_esperadas=None):
+        self.pasta = Path(pasta)
+        self.pasta.mkdir(parents=True, exist_ok=True)
+        self.log = (self.pasta / "eventos.jsonl").open("x", encoding="utf-8", buffering=1)
         self.sanitizador = Sanitizador()
         self.inicio = time.monotonic()
-        self.ativo = False
+        self.timeout_download = timeout_download
+        self.paginas_esperadas = paginas_esperadas
         self.paginas = {}
-        self.frames = {}
         self.requisicoes = {}
-        self.pendentes = set()
-        self.ultimos_dom = {}
-        self.mimes_frames = {}
-        self.dom_omitidos = set()
-        self.contagens = {}
+        self.respostas = {}
+        self.respostas_por_id = {}
+        self.ultimas_requisicoes = {}
+        self.tarefas = set()
+        self.copias = set()
+        self.transferencias = set()
+        self.validacoes = set()
+        self.trava_validacao = asyncio.Lock()
+        self.partes = set()
+        self.resultados = []
+        self.contagens = Counter()
+        self.aceitar_downloads = True
+        self.rede_ativa = True
+        self.fechado = False
         self.linhas = 0
-        self.limitado = False
-        self.context = None
-        self.encerrado = False
-        self.etapa = "inicializacao"
+        self.ultimo_download = None
+        self.motivo = "em_execucao"
 
     def registrar(self, evento, **dados):
-        if self.encerrado:
+        if self.fechado:
             return
-        self.contagens[evento] = self.contagens.get(evento, 0) + 1
-        if evento == "javascript_erro" and self.contagens[evento] > 50:
-            if self.contagens[evento] == 51:
-                self.registrar("limite_eventos_javascript", limite=50)
+        self.contagens[evento] += 1
+        if self.linhas >= 30000 and evento not in {"fim", "falha", "download_resultado"}:
+            if self.linhas == 30000:
+                self.log.write('{"evento":"limite_eventos","limite":30000}\n')
+                self.linhas += 1
             return
-        if self.linhas >= 30000 and evento not in {"fim_diagnostico", "falha", "observacao_encerrada"}:
-            if not self.limitado:
-                self.limitado = True
-                self.arquivo.write(json.dumps({"evento": "limite_total_eventos", "limite": 30000}) + "\n")
-            return
-        linha = {"segundos": round(time.monotonic() - self.inicio, 3),
-                 "evento": evento, **dados}
-        self.arquivo.write(json.dumps(linha, ensure_ascii=True) + "\n")
+        self.log.write(json.dumps({"segundos": round(time.monotonic() - self.inicio, 3),
+                                   "evento": evento, **dados}, ensure_ascii=True) + "\n")
         self.linhas += 1
 
-    def marcar(self, etapa):
-        self.etapa = etapa
-        self.registrar("etapa", nome=etapa)
-        print(f"Etapa: {etapa}", flush=True)
+    def tarefa(self, coroutine, grupo=None):
+        task = asyncio.create_task(coroutine)
+        self.tarefas.add(task)
+        if grupo is not None:
+            grupo.add(task)
 
-    def proteger(self, nome, funcao):
-        def callback(*args):
-            try:
-                funcao(*args)
-            except Exception as erro:
-                # Excecoes Playwright podem conter URLs, valores e trechos HTML.
-                self.registrar("observador_indisponivel", observador=nome,
-                               classe=type(erro).__name__)
-        return callback
+        def terminou(completed):
+            self.tarefas.discard(completed)
+            if grupo is not None:
+                grupo.discard(completed)
+            if not completed.cancelled():
+                erro = completed.exception()
+                if erro:
+                    self.registrar("observador_falhou", classe=type(erro).__name__)
 
-    def frame_id(self, frame):
-        if frame is None:
-            return None
-        return self.frames.setdefault(frame, f"F{len(self.frames) + 1:03d}")
+        task.add_done_callback(terminou)
+        return task
 
     def pagina_id(self, page):
         return self.paginas.setdefault(page, f"P{len(self.paginas) + 1:03d}")
 
-    def observar_frame(self, evento, frame):
-        self.registrar(evento, frame_id=self.frame_id(frame),
-                       pagina_id=self.pagina_id(frame.page),
-                       pai_id=self.frame_id(frame.parent_frame),
-                       endereco=self.sanitizador.url(frame.url))
-
     def observar_pagina(self, page):
         if page in self.paginas:
             return
-        pagina_id = self.pagina_id(page)
-        opener = page.opener()
-        self.registrar("pagina", pagina_id=pagina_id,
-                       origem_pagina_id=self.pagina_id(opener) if opener else None,
-                       endereco=self.sanitizador.url(page.url))
-        for evento in ("frameattached", "framenavigated", "framedetached"):
-            page.on(evento, self.proteger(evento, lambda frame, ev=evento: self.observar_frame(ev, frame)))
-        page.on("download", self.proteger("download", lambda download: self.registrar(
-            "download_iniciado", pagina_id=pagina_id,
-            endereco=self.sanitizador.url(download.url))))
-        page.on("close", lambda: self.registrar("pagina_fechada", pagina_id=pagina_id))
-        page.on("pageerror", lambda _erro: self.registrar("javascript_erro", pagina_id=pagina_id))
-        page.on("crash", lambda: self.registrar("pagina_crash", pagina_id=pagina_id))
-        for frame in page.frames:
-            self.observar_frame("frame_inicial", frame)
+        pid = self.pagina_id(page)
+        # Instalar listener antes de qualquer await, inclusive em pop-ups.
+        page.on("download", self.receber_download)
+        page.on("framenavigated", lambda frame: self.registrar(
+            "frame_navegou", pagina_id=pid, principal=frame == page.main_frame,
+            endereco=self.sanitizador.url(frame.url)))
+        page.on("crash", lambda: self.registrar("pagina_crash", pagina_id=pid))
+        page.on("close", lambda: self.registrar("pagina_fechada", pagina_id=pid))
+        self.registrar("pagina", pagina_id=pid, endereco=self.sanitizador.url(page.url))
 
     def instalar(self, context):
         self.context = context
-        context.on("page", self.proteger("page", self.observar_pagina))
+        context.on("page", self.observar_pagina)
         for page in context.pages:
             self.observar_pagina(page)
-        for evento, handler in (("request", self.requisicao), ("response", self.resposta),
-                                ("requestfinished", self.finalizada), ("requestfailed", self.falhou)):
-            context.on(evento, self.proteger(evento, handler))
-
-    def iniciar_exportacao(self):
-        self.ativo = True
-        self.registrar("inicio_captura_rede", limite_requisicoes=10000)
-        self.marcar("exportacao")
+        context.on("request", self.requisicao)
+        context.on("response", self.resposta)
+        context.on("requestfinished", lambda request: self.tarefa(self.concluida(request)) if self.rede_ativa else None)
+        context.on("requestfailed", self.falhou)
+        self.registrar("captura_iniciada", modo="manual", antes_de_abrir_site=True)
 
     def requisicao(self, request):
-        if not self.ativo or request in self.requisicoes:
+        if not self.rede_ativa or request in self.requisicoes:
             return
         if len(self.requisicoes) >= 10000:
-            if not self.contagens.get("limite_requisicoes"):
+            if not self.contagens["limite_requisicoes"]:
                 self.registrar("limite_requisicoes", limite=10000)
             return
         rid = f"Q{len(self.requisicoes) + 1:05d}"
         self.requisicoes[request] = rid
-        self.pendentes.add(rid)
-        try:
-            frame = request.frame
-        except PlaywrightErro:
-            frame = None
-        # Estes valores existem apenas transitoriamente; o log recebe allowlist.
-        headers = request.all_headers()
+        self.ultimas_requisicoes[request.url] = rid
+        # Registrar antes do await de headers para manter a correlacao cronologica.
         self.registrar("requisicao", requisicao_id=rid, metodo=request.method,
-                       tipo=request.resource_type, navegacao=request.is_navigation_request(),
-                       frame_id=self.frame_id(frame),
-                       pagina_id=self.pagina_id(frame.page) if frame else None,
-                       endereco=self.sanitizador.url(request.url),
-                       redirecionada_de=self.requisicoes.get(request.redirected_from),
-                       cookie_presente=bool(headers.get("cookie")),
-                       authorization_presente=bool(headers.get("authorization")),
-                       csrf_header_presente=any(k in headers for k in ("x-csrf-token", "x-xsrf-token", "csrf-token")),
-                       referer=self.sanitizador.url(headers["referer"]) if headers.get("referer") else None,
-                       range=intervalo(headers.get("range")))
+                       tipo=request.resource_type, endereco=self.sanitizador.url(request.url),
+                       redirecionada_de=self.requisicoes.get(request.redirected_from))
+        self.tarefa(self.cabecalhos(request, rid))
+
+    async def cabecalhos(self, request, rid):
+        try:
+            h = await request.all_headers()
+            self.registrar("cabecalhos_requisicao", requisicao_id=rid,
+                cookie_presente=bool(h.get("cookie")),
+                authorization_presente=bool(h.get("authorization")),
+                csrf_presente=any(k in h for k in ("x-csrf-token", "x-xsrf-token", "csrf-token")),
+                referer=self.sanitizador.url(h["referer"]) if h.get("referer") else None,
+                range=intervalo(h.get("range")))
+        except PlaywrightErro:
+            self.registrar("cabecalhos_indisponiveis", requisicao_id=rid)
 
     def resposta(self, response):
-        request = response.request
-        h = response.headers
-        # Guardar apenas MIME da navegacao, inclusive durante o login. Nao avaliar
-        # DOM de renderer PDF/visualizador: pode nunca responder a evaluate().
-        if request.resource_type == "document":
-            try:
-                self.mimes_frames[request.frame] = mime(h.get("content-type"))
-            except PlaywrightErro:
-                pass
-        if not self.ativo:
+        if not self.rede_ativa:
             return
+        request = response.request
         if request not in self.requisicoes:
             self.requisicao(request)
-        rid = self.requisicoes.get(request)
-        if not rid:
-            return
-        disposition = h.get("content-disposition", "").split(";", 1)[0].strip().lower()
+        h = response.headers
         encoding = h.get("content-encoding", "").strip().lower()
-        self.registrar("resposta", requisicao_id=rid, status=response.status,
+        disposition = h.get("content-disposition", "").split(";", 1)[0].strip().lower()
+        dados = {"requisicao_id": self.requisicoes.get(request),
+                 "status": response.status, "content_type": mime(h.get("content-type")),
+                 "content_length": numero(h.get("content-length")),
+                 "content_range": intervalo(h.get("content-range")),
+                 "tem_content_range": bool(h.get("content-range")),
+                 "content_encoding": encoding if encoding in {"", "identity", "gzip", "br", "deflate", "zstd"} else "outro",
+                 "disposition": disposition if disposition in {"inline", "attachment"} else "ausente_ou_outro",
+                 "via_service_worker": bool(response.from_service_worker)}
+        if len(self.respostas) < 10000 or response.url in self.respostas:
+            self.respostas[response.url] = dados
+        if dados["requisicao_id"]:
+            self.respostas_por_id[dados["requisicao_id"]] = dados
+        self.registrar("resposta",
                        endereco=self.sanitizador.url(response.url),
-                       content_type=mime(h.get("content-type")),
-                       content_length=numero(h.get("content-length")),
-                       content_range=intervalo(h.get("content-range")),
-                       accept_ranges=h.get("accept-ranges", "").lower() == "bytes",
-                       content_encoding=encoding if encoding in {"", "identity", "gzip", "br", "deflate", "zstd"} else "outro",
-                       transfer_chunked="chunked" in h.get("transfer-encoding", "").lower(),
-                       disposition=disposition if disposition in {"inline", "attachment"} else "ausente_ou_outro",
-                       filename_presente="filename" in h.get("content-disposition", "").lower(),
                        location=self.sanitizador.url(urljoin(response.url, h["location"])) if h.get("location") else None,
-                       via_service_worker=bool(response.from_service_worker))
+                       **dados)
 
-    def finalizada(self, request):
-        if not self.ativo:
-            return
+    async def concluida(self, request):
         rid = self.requisicoes.get(request)
         if not rid:
             return
-        self.pendentes.discard(rid)
         try:
-            tamanhos = request.sizes()
+            tamanho = (await request.sizes()).get("responseBodySize")
         except PlaywrightErro:
-            tamanhos = {}
-        self.registrar("requisicao_concluida", requisicao_id=rid,
-                       bytes_resposta_codificados=tamanhos.get("responseBodySize"),
-                       bytes_requisicao=tamanhos.get("requestBodySize"))
+            tamanho = None
+        self.registrar("requisicao_concluida", requisicao_id=rid, bytes_codificados=tamanho)
 
     def falhou(self, request):
-        if not self.ativo:
+        if not self.rede_ativa:
             return
-        rid = self.requisicoes.get(request)
-        if not rid:
-            return
-        self.pendentes.discard(rid)
         failure = request.failure or ""
-        # Somente codigos Chromium, nunca o texto livre de uma excecao.
-        codigo = failure if re.fullmatch(r"net::ERR_[A-Z_0-9]+", failure) else "erro_omitido"
-        self.registrar("requisicao_falhou", requisicao_id=rid, codigo=codigo)
+        codigo = failure if re.fullmatch(r"net::ERR_[A-Z_0-9]+", failure) else "omitido"
+        self.registrar("requisicao_falhou", requisicao_id=self.requisicoes.get(request), codigo=codigo)
 
-    def inspecionar_dom(self):
-        for page in list(self.context.pages):
-            for frame in list(page.frames):
-                if (self.mimes_frames.get(frame) != "text/html"
-                        or not frame.url.startswith(("http://", "https://"))):
-                    if frame not in self.dom_omitidos:
-                        self.dom_omitidos.add(frame)
-                        self.registrar("inspecao_dom_omitida", frame_id=self.frame_id(frame),
-                                       pagina_id=self.pagina_id(page),
-                                       motivo="frame_sem_navegacao_html_observada", endereco=self.sanitizador.url(frame.url))
-                    continue
-                try:
-                    dados = frame.evaluate("""() => ({
-                        frameset: !!document.querySelector('frameset'),
-                        adf_loopback: typeof window.AdfLoopbackUtils !== 'undefined',
-                        janela_nomeada: !!window.name,
-                        elementos: Array.from(document.querySelectorAll('frame,iframe,embed,object'))
-                            .slice(0, 50).map(e => ({tag: e.tagName.toLowerCase(),
-                                url: e.tagName === 'OBJECT' ? e.data : e.src}))
-                    })""")
-                    seguro = {"frame_id": self.frame_id(frame),
-                              "pagina_id": self.pagina_id(page),
-                              "pai_id": self.frame_id(frame.parent_frame),
-                              "frameset": dados["frameset"],
-                              "adf_loopback": dados["adf_loopback"], "janela_nomeada": dados["janela_nomeada"],
-                              "endereco": self.sanitizador.url(frame.url),
-                              "elementos": [{"tag": e["tag"], "endereco": self.sanitizador.url(e["url"])}
-                                            for e in dados["elementos"]]}
-                    chave = json.dumps(seguro, sort_keys=True)
-                    if self.ultimos_dom.get(frame) != chave:
-                        self.ultimos_dom[frame] = chave
-                        self.registrar("estrutura_visualizador", **seguro)
-                except PlaywrightErro:
-                    pass  # Frame pode navegar/fechar durante a observacao.
-
-    def fechar(self, motivo):
-        if self.encerrado:
+    def receber_download(self, download):
+        self.contagens["downloads_recebidos"] += 1
+        did = self.contagens["downloads_recebidos"]
+        self.registrar("download_iniciado", download_id=did, pagina_id=self.pagina_id(download.page),
+                       endereco=self.sanitizador.url(download.url))
+        self.ultimo_download = time.monotonic()
+        if not self.aceitar_downloads or did > 5:
+            self.registrar("download_recusado", download_id=did, motivo="limite_ou_encerramento")
+            self.tarefa(download.cancel())
             return
-        self.registrar("fim_diagnostico", motivo=motivo, etapa=self.etapa,
-                       requisicoes_pendentes=sorted(self.pendentes),
-                       contagens=dict(self.contagens), pdf_validado=False)
-        self.encerrado = True
-        self.arquivo.close()
+        # Fixar o request no instante do evento. Uma nova consulta ADF ao mesmo
+        # URL nao pode substituir os cabecalhos deste download enquanto ele baixa.
+        requisicao_id = self.ultimas_requisicoes.get(download.url)
+        self.tarefa(self.preservar(download, did, requisicao_id), self.transferencias)
 
-
-def solicitar_token():
-    resultado = {"valor": ""}
-    janela = tk.Tk()
-    janela.title("SBK - Dupla Autenticacao")
-    janela.geometry("500x220")
-    janela.resizable(False, False)
-    tk.Label(janela, text="Dupla Autenticacao", font=("Segoe UI", 12, "bold")).pack(pady=(20, 10))
-    tk.Label(janela, text="Digite o token recebido por e-mail para continuar.", wraplength=450).pack()
-    entrada = ttk.Entry(janela, width=35, justify="center", show="*")
-    entrada.pack(pady=15)
-    entrada.focus()
-
-    def confirmar():
-        valor = entrada.get().strip()
-        if valor:
-            resultado["valor"] = valor
-            janela.destroy()
-
-    ttk.Button(janela, text="Confirmar", command=confirmar).pack()
-    janela.bind("<Return>", lambda _event: confirmar())
-    janela.mainloop()
-    if not resultado["valor"]:
-        raise ConfiguracaoErro("Entrada do token cancelada.")
-    return resultado["valor"]
-
-
-def executar(config, coletor, espera):
-    with sync_playwright() as p:
-        browser = p.chromium.launch(channel="msedge", headless=False,
-            args=["--disable-popup-blocking", "--allow-popups-during-page-unload"])
-        browser.on("disconnected", lambda: coletor.registrar("navegador_desconectado"))
+    async def preservar(self, download, did, requisicao_id=None):
+        parte = self.pasta / f"documento_{did:03d}.part"
+        final = self.pasta / f"documento_{did:03d}.pdf"
+        self.partes.add(parte)
+        resultado = {"download_id": did, "ok": False, "motivo": "nao_concluido",
+                     "http": None, "bytes": None, "paginas": None, "sha256": None}
+        copia = asyncio.create_task(download.save_as(parte))
+        self.copias.add(copia)
+        copia.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        tarefa_validacao = None
         try:
-            coletor.registrar("ambiente", python=sys.version.split()[0],
-                               playwright=version("playwright"), navegador=browser.version,
-                               tls_verificado=True, interceptacao=False)
-            context = browser.new_context(accept_downloads=True)
-            context.set_default_timeout(30000)
-            context.set_default_navigation_timeout(120000)
-            coletor.instalar(context)
-            page = context.new_page()
-            coletor.marcar("abrir_site_login_manual")
-            page.goto(config["URL_SBK"], wait_until="domcontentloaded")
-            print("Realize o login normalmente. Aguarde a janela para informar o token.", flush=True)
-            page.wait_for_selector("#duplaAutenticacao\\:\\:\\:content", timeout=120000)
-            token = solicitar_token()
-            page.fill("#duplaAutenticacao\\:\\:\\:content", token)
-            del token
-            autenticar = page.locator("#b4 a")
-            if autenticar.count() and autenticar.first.is_visible():
-                autenticar.first.click()
-            else:
-                page.get_by_text("Autenticar", exact=True).click()
-            # A tela seguinte confirma que o fluxo avancou; networkidle nao prova login.
-            coletor.marcar("selecionar_cliente")
-            page.locator("#pt1\\:\\:sorTipoPesquisa\\:\\:_1").click(timeout=120000)
-            page.wait_for_timeout(1000)
-            coletor.marcar("preencher_identificador")
-            page.fill("#pt1\\:\\:itTipoPesquisaItem\\:\\:\\:content", config["ID_TESTE"])
-            page.wait_for_timeout(1000)
-            coletor.marcar("pesquisar_documento")
-            page.click("#pt1\\:\\:btPesquisarDocumento")
-            page.wait_for_timeout(5000)
-            coletor.marcar("selecionar_documentos")
-            chk1 = "#pt1\\:\\:pc1\\:\\:t1\\:\\:sbcSelectAllDoc\\:\\:\\:content"
-            page.wait_for_selector(chk1, timeout=15000)
-            page.wait_for_timeout(2000)
-            page.locator(chk1).set_checked(True)
-            page.wait_for_timeout(2000)
-            coletor.marcar("confirmar_filtro")
-            page.locator("#pt1\\:\\:pc1\\:\\:btConfirmarFiltro > a").click(timeout=15000)
-            coletor.marcar("selecionar_detalhes")
-            chk2 = "#pt1\\:\\:pcIPD\\:\\:t3\\:\\:sbcSelectAllDocDet\\:\\:\\:content"
-            page.wait_for_selector(chk2, timeout=15000)
-            page.wait_for_timeout(2000)
-            page.locator(chk2).set_checked(True)
-            page.wait_for_timeout(3000)
-            exportar = page.locator("#pt1\\:\\:pcIPD\\:\\:btDownloadImgSelect > a")
-            exportar.wait_for(timeout=15000)
-            page.wait_for_timeout(3000)
-            exportar.scroll_into_view_if_needed()
-            coletor.iniciar_exportacao()
-            inicio_exportacao = time.monotonic()
-            exportar.click(no_wait_after=True)
-            print("Observando a exportacao. Nao clique novamente em Exportar.", flush=True)
-            print("Apos o PDF carregar, voce pode encerrar com Ctrl+C neste terminal.", flush=True)
-            proximo_dom = 0
-            proximo_aviso = 0
-            while time.monotonic() - inicio_exportacao < espera:
-                decorrido = time.monotonic() - inicio_exportacao
-                if decorrido >= proximo_dom:
-                    coletor.inspecionar_dom()
-                    proximo_dom = decorrido + 5
-                if decorrido >= proximo_aviso:
-                    print(f"Observacao: {int(decorrido)}s; respostas: {coletor.contagens.get('resposta', 0)}; "
-                          f"downloads iniciados: {coletor.contagens.get('download_iniciado', 0)}", flush=True)
-                    proximo_aviso = decorrido + 30
-                if not browser.is_connected() or not context.pages:
-                    return "navegador_fechado"
-                # Espera diagnostica: entrega controle ao dispatcher sync do Playwright.
-                context.pages[0].wait_for_timeout(250)
-            return "prazo_observacao_encerrado"
+            # wait nao cancela a chamada Playwright em andamento por timeout e
+            # nao deixa futures intermediarios de shield imprimirem erros brutos.
+            concluidas, _ = await asyncio.wait({copia}, timeout=self.timeout_download)
+            if not concluidas:
+                raise asyncio.TimeoutError
+            copia.result()
+            falha = await asyncio.wait_for(download.failure(), 15)
+            if falha:
+                raise DocumentoInvalido("DOWNLOAD_NATIVO_FALHOU")
+            # Dar uma volta ao dispatcher para receber cabecalhos ja emitidos.
+            await asyncio.sleep(0)
+            http = self.respostas_por_id.get(requisicao_id)
+            resultado["http"] = http
+            if http:
+                if http["status"] in {401, 403}:
+                    raise DocumentoInvalido("HTTP_AUTENTICACAO_NEGADA")
+                if http["status"] >= 400:
+                    raise DocumentoInvalido("HTTP_ERRO")
+                if http["status"] == 206 or http["tem_content_range"]:
+                    raise DocumentoInvalido("HTTP_PARCIAL_REQUER_INVESTIGACAO")
+                if http["content_type"] in {"text/html", "application/json", "text/json", "application/xml", "text/xml"}:
+                    raise DocumentoInvalido("HTTP_NAO_PDF")
+                if http["content_length"] is not None and http["content_encoding"] in {"", "identity"}:
+                    if parte.stat().st_size != http["content_length"]:
+                        raise DocumentoInvalido("TAMANHO_HTTP_DIVERGENTE")
+            if final.exists():
+                raise DocumentoInvalido("DESTINO_JA_EXISTE")
+            with parte.open("r+b") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+            async def validar_em_fila():
+                # O logger pypdf e global; serializar validacoes evita misturar
+                # avisos de dois documentos, mantendo a tarefa viva no cleanup.
+                async with self.trava_validacao:
+                    return await asyncio.to_thread(validar_pdf, parte, self.paginas_esperadas)
+
+            tarefa_validacao = asyncio.create_task(validar_em_fila())
+            self.validacoes.add(tarefa_validacao)
+            await asyncio.wait({tarefa_validacao})
+            validacao = tarefa_validacao.result()
+            self.validacoes.discard(tarefa_validacao)
+            # Mesmo diretorio/volume: promover somente depois de concluir e validar.
+            os.replace(parte, final)
+            self.partes.discard(parte)
+            resultado.update(validacao, ok=True, motivo="PDF_ESTRUTURA_VALIDADA", arquivo=final.name)
+            print(f"PDF salvo e validado: {final.name}; paginas={validacao['paginas']}; bytes={validacao['bytes']}", flush=True)
+        except asyncio.TimeoutError:
+            resultado["motivo"] = "TIMEOUT_DOWNLOAD"
+            with suppress(PlaywrightErro, asyncio.TimeoutError):
+                await asyncio.wait_for(download.cancel(), 10)
+            with suppress(Exception):
+                concluidas, _ = await asyncio.wait({copia}, timeout=10)
+                if concluidas:
+                    copia.result()
+        except DocumentoInvalido as erro:
+            # As mensagens desta classe sao codigos fixos, nunca valores do PDF.
+            resultado["motivo"] = str(erro)
+        except PlaywrightErro as erro:
+            texto = str(erro)
+            codigo = re.search(r"\bnet::ERR_[A-Z_0-9]+\b", texto)
+            resultado["motivo"] = (codigo.group(0) if codigo else
+                "DOWNLOAD_CANCELADO" if "canceled" in texto.lower() or "cancelled" in texto.lower()
+                else "DOWNLOAD_NATIVO_FALHOU")
+        except OSError as erro:
+            resultado["motivo"] = f"FALHA_DISCO_ERRNO_{erro.errno}"
+        except asyncio.CancelledError:
+            resultado["motivo"] = "INTERROMPIDO"
+            with suppress(PlaywrightErro, asyncio.TimeoutError):
+                await asyncio.wait_for(download.cancel(), 5)
+            raise
+        except Exception as erro:
+            resultado["motivo"] = "FALHA_LOCAL_" + type(erro).__name__
         finally:
-            # Snapshot antes do fechamento. O chamador ainda precisa registrar
-            # eventuais excecoes e o motivo real antes de fechar o arquivo.
-            coletor.registrar("observacao_encerrada", etapa=coletor.etapa,
-                               requisicoes_pendentes=sorted(coletor.pendentes))
-            coletor.ativo = False
+            if copia.done():
+                self.copias.discard(copia)
+                if not copia.cancelled():
+                    # Recuperar a excecao sem imprimir texto ou traceback.
+                    copia.exception()
+                if not resultado["ok"] and (tarefa_validacao is None or tarefa_validacao.done()):
+                    with suppress(OSError):
+                        parte.unlink(missing_ok=True)
+                    if not parte.exists():
+                        self.partes.discard(parte)
+            self.resultados.append(resultado)
+            self.registrar("download_resultado", **resultado)
+
+    async def aguardar(self, browser, espera):
+        limite = time.monotonic() + espera
+        proximo_aviso = 0
+        while browser.is_connected() and self.context.pages:
+            agora = time.monotonic()
+            # Um download iniciado dentro do prazo pode terminar depois dele.
+            if agora >= limite and not self.transferencias:
+                return "PRAZO_OBSERVACAO"
+            if self.resultados and not self.transferencias and agora - self.ultimo_download >= 2:
+                return "DOWNLOAD_PROCESSADO"
+            if agora >= proximo_aviso:
+                print(f"Observando: respostas={self.contagens['resposta']}; downloads={self.contagens['downloads_recebidos']}. "
+                      "Login, token e navegacao sao manuais neste diagnostico.", flush=True)
+                proximo_aviso = agora + 30
+            await asyncio.sleep(0.2)
+        # O usuario pode ter fechado a pagina que iniciou a transferencia.
+        if self.transferencias:
+            await asyncio.gather(*list(self.transferencias), return_exceptions=True)
+        return "NAVEGADOR_FECHADO"
+
+    async def encerrar(self, browser):
+        self.aceitar_downloads = False
+        self.rede_ativa = False
+        for task in list(self.transferencias):
+            task.cancel()
+        if self.transferencias:
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.gather(*list(self.transferencias), return_exceptions=True), 20)
+        if browser is not None:
+            with suppress(PlaywrightErro, asyncio.TimeoutError):
+                await asyncio.wait_for(browser.close(), 20)
+        if self.copias:
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.gather(*list(self.copias), return_exceptions=True), 5)
+        # Cancelar to_thread nao para o parser. Esperar terminar antes de apagar
+        # qualquer arquivo que ele possa ainda estar lendo, especialmente Windows.
+        if self.validacoes:
+            await asyncio.gather(*list(self.validacoes), return_exceptions=True)
+            self.validacoes.clear()
+        # Limpar parciais somente depois de encerrar as gravacoes do navegador.
+        for parte in self.partes:
+            with suppress(OSError):
+                parte.unlink(missing_ok=True)
+        for task in list(self.tarefas):
+            if not task.done():
+                task.cancel()
+        if self.tarefas:
+            await asyncio.gather(*list(self.tarefas), return_exceptions=True)
+
+    def resumo(self):
+        escolhido = next((r for r in self.resultados if r["ok"]),
+                         self.resultados[-1] if self.resultados else {})
+        http = escolhido.get("http") or {}
+        linhas = ["DIAGNOSTICO_SBK_V2",
+            "MODO=MANUAL; CAPTURA=DESDE_INICIO",
+            f"ENCERRAMENTO={self.motivo}",
+            f"PAGINAS_NAVEGADOR={len(self.paginas)}; RESPOSTAS_HTTP={self.contagens['resposta']}",
+            f"DOWNLOADS_INICIADOS={self.contagens['downloads_recebidos']}",
+            f"HTTP_DOWNLOAD={http.get('status', 'NAO_OBSERVADO')}",
+            f"MIME_DOWNLOAD={http.get('content_type', 'NAO_OBSERVADO')}",
+            f"CONTENT_LENGTH={http.get('content_length')}",
+            f"RESULTADO={escolhido.get('motivo', 'NENHUM_DOWNLOAD')}",
+            f"PDF_VALIDADO_ESTRUTURA={'SIM' if escolhido.get('ok') else 'NAO'}",
+            f"BYTES={escolhido.get('bytes')}; PAGINAS_PDF={escolhido.get('paginas')}",
+            f"PAGINAS_ESPERADAS={self.paginas_esperadas}",
+            f"SHA256={escolhido.get('sha256')}",
+            f"ARQUIVO={escolhido.get('arquivo', 'NAO_SALVO')}",
+            f"PARCIAIS_RESTANTES={sum(p.exists() for p in self.partes)}",
+            "SEM_REQUISICAO_EXTRA; SEM_IMPRESSAO; SEM_RECONSTRUCAO"]
+        texto = "\n".join(linhas) + "\n"
+        (self.pasta / "resumo.txt").write_text(texto, encoding="utf-8")
+        print("\n" + texto, flush=True)
+        self.registrar("fim", motivo=self.motivo, resultados=self.resultados)
+        self.fechado = True
+        self.log.close()
+        return any(r["ok"] for r in self.resultados)
+
+
+async def executar_manual(config, monitor, espera):
+    async with async_playwright() as p:
+        browser = None
+        try:
+            browser = await p.chromium.launch(channel="msedge", headless=False,
+                args=["--disable-popup-blocking", "--allow-popups-during-page-unload"])
+            monitor.registrar("ambiente", versao_script="2.0", python=sys.version.split()[0],
+                              playwright=version("playwright"), navegador=browser.version,
+                              tls_verificado=True, interceptacao=False)
+            context = await browser.new_context(accept_downloads=True)
+            monitor.instalar(context)
+            page = await context.new_page()
+            print("MODO MANUAL: faca login, informe o token no site e navegue ate Exportar.", flush=True)
+            print("O programa captura o download do navegador; nao executa cliques neste modo.", flush=True)
             try:
-                browser.close()
-            except PlaywrightErro:
-                pass
+                await page.goto(config["URL_SBK"], wait_until="domcontentloaded", timeout=60000)
+            except PlaywrightErro as erro:
+                monitor.registrar("navegacao_inicial_incompleta", classe=type(erro).__name__)
+                print("A navegacao inicial nao concluiu no prazo. A observacao continua no navegador aberto.", flush=True)
+            print("Exporte uma unica vez. Se o PDF apenas aparecer, use o botao Baixar do visualizador uma vez.", flush=True)
+            print("Aguarde a mensagem PDF salvo e validado. Evite Ctrl+C durante a transferencia.", flush=True)
+            monitor.motivo = await monitor.aguardar(browser, espera)
+        except asyncio.CancelledError:
+            monitor.motivo = "INTERROMPIDO_MANUALMENTE"
+        except Exception as erro:
+            monitor.motivo = "FALHA_" + type(erro).__name__
+            monitor.registrar("falha", classe=type(erro).__name__)
+        finally:
+            await monitor.encerrar(browser)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Observa uma exportacao SBK sem ler corpos nem validar o PDF.")
+    parser = argparse.ArgumentParser(description="Diagnostico manual com preservacao e validacao do download nativo.")
     parser.add_argument("--env", type=Path, default=Path(__file__).with_name(".env"))
-    parser.add_argument("--espera", type=int, default=600, help="Segundos de observacao apos exportar (30 a 3600).")
+    parser.add_argument("--espera", type=int, default=900, help="Prazo para login/navegacao manual, em segundos.")
+    parser.add_argument("--timeout-download", type=int, default=1200, help="Prazo por transferencia, em segundos.")
+    parser.add_argument("--paginas-esperadas", type=int, default=None)
     args = parser.parse_args()
-    if not 30 <= args.espera <= 3600:
-        parser.error("--espera deve estar entre 30 e 3600 segundos.")
+    if not 30 <= args.espera <= 7200 or not 10 <= args.timeout_download <= 7200:
+        parser.error("Use --espera entre 30 e 7200 e --timeout-download entre 10 e 7200.")
+    if args.paginas_esperadas is not None and args.paginas_esperadas <= 0:
+        parser.error("--paginas-esperadas deve ser um inteiro positivo.")
     try:
         config = configurar(args.env)
     except ConfiguracaoErro as erro:
-        print(f"Configuracao: {erro}", file=sys.stderr)
+        print("Configuracao: " + str(erro), file=sys.stderr)
         return 2
-    destino = Path(__file__).with_name(datetime.now().strftime("diagnostico_sbk_%Y%m%d_%H%M%S_%f.jsonl"))
+    pasta = Path(__file__).with_name(datetime.now().strftime("coleta_sbk_v2_%Y%m%d_%H%M%S_%f"))
     try:
-        coletor = Coletor(destino)
+        monitor = Monitor(pasta, args.timeout_download, args.paginas_esperadas)
     except OSError:
-        print("Nao foi possivel criar o log; extraia o pacote em uma pasta com permissao de escrita.", file=sys.stderr)
+        print("Nao foi possivel criar a pasta de diagnostico; use uma pasta com permissao de escrita.", file=sys.stderr)
         return 2
-    codigo = 0
     try:
-        motivo = executar(config, coletor, args.espera)
+        asyncio.run(executar_manual(config, monitor, args.espera))
     except KeyboardInterrupt:
-        motivo = "interrupcao_manual"
+        monitor.motivo = "INTERROMPIDO_MANUALMENTE"
     except Exception as erro:
-        # Nao imprimir str(erro), pois pode conter URL, token, identificador ou HTML.
-        coletor.registrar("falha", etapa=coletor.etapa, classe=type(erro).__name__,
-                           timeout=isinstance(erro, PlaywrightTimeout))
-        print(f"Diagnostico interrompido na etapa {coletor.etapa} ({type(erro).__name__}).", flush=True)
-        motivo = "falha"
-        codigo = 1
+        monitor.motivo = "FALHA_INICIAL_" + type(erro).__name__
+        monitor.registrar("falha", classe=type(erro).__name__)
     finally:
-        coletor.fechar(locals().get("motivo", "fim"))
-    print(f"Log sanitizado: {destino.name}", flush=True)
-    print("Coleta encerrada. A integridade e o download do PDF ainda NAO foram comprovados.", flush=True)
-    return codigo
+        ok = monitor.resumo()
+    print(f"Pasta local: {pasta.name}. Para relatar o teste, transcreva somente resumo.txt.", flush=True)
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
