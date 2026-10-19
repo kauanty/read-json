@@ -1,543 +1,505 @@
+"""Diagnostico de uma exportacao SBK. Nao salva copia final nem valida o PDF.
+
+Mantem o login manual e os seletores do app.py recebido. Observa metadados,
+sem route.fetch(), repetir URLs, ler corpos HTTP ou gravar credenciais.
+"""
+
 from __future__ import annotations
 
+import argparse
+from datetime import datetime
+from importlib.metadata import version
 import json
-import re
-import ast
-import threading
-import traceback
-from collections import OrderedDict
-from dataclasses import dataclass, field
 from pathlib import Path
-from queue import Queue, Empty
-from typing import Any, Callable, Iterable
-
-from openpyxl import Workbook, load_workbook
-from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
-
-try:
-    import customtkinter as ctk
-except ImportError:  # pragma: no cover - exercised manually in restricted hosts
-    ctk = None
-
+import re
+import sys
+import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import ttk
+from urllib.parse import urljoin, urlsplit
+
+from dotenv import dotenv_values
+from playwright.sync_api import Error as PlaywrightErro
+from playwright.sync_api import TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright
 
 
-DEFAULT_JSON_COLUMN = "JSON Dados Solicitação"
-DEFAULT_SERVICE_TITLE_KEY = "titulo"
-DEFAULT_NUMBER_COLUMN = "Número"
-EMPTY_VALUE = "Campo Vazio"
-JSON_ERROR_VALUE = "ERRO-JSON"
-ERROR_SHEET = "ERROS_JSON"
-MAX_SHEET_TITLE_LENGTH = 30
-MAX_COLUMN_WIDTH = 60
-MIN_COLUMN_WIDTH = 12
-DATA_ROW_HEIGHT = 15
-HEADER_GROUP_COLORS = ("D6EAF8", "C8F2B9")
+class ConfiguracaoErro(ValueError):
+    pass
 
 
-ProgressCallback = Callable[[int, int], None]
-
-
-@dataclass
-class ProcessConfig:
-    input_path: Path
-    output_path: Path
-    json_column_name: str = DEFAULT_JSON_COLUMN
-    service_title_key: str = DEFAULT_SERVICE_TITLE_KEY
-    number_column_name: str = DEFAULT_NUMBER_COLUMN
-
-
-@dataclass
-class SheetDataset:
-    original_title: str
-    root_columns: "OrderedDict[str, OrderedDict[str, None]]" = field(default_factory=OrderedDict)
-    rows: list[dict[str, Any]] = field(default_factory=list)
-
-    def add_row(self, number: Any, raw_json: Any, fields: dict[str, OrderedDict[str, Any]]) -> None:
-        for root_key, root_fields in fields.items():
-            self.root_columns.setdefault(root_key, OrderedDict())
-            for column_title in root_fields.keys():
-                self.root_columns[root_key].setdefault(column_title, None)
-
-        self.rows.append(
-            {
-                DEFAULT_NUMBER_COLUMN: sanitize_cell_value(number),
-                DEFAULT_JSON_COLUMN: sanitize_cell_value(raw_json),
-                "fields": fields,
-            }
-        )
-
-
-def sanitize_cell_value(value: Any) -> Any:
-    if value is None:
-        return EMPTY_VALUE
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            return EMPTY_VALUE
-        return ILLEGAL_CHARACTERS_RE.sub("", value)
-    return value
-
-
-def is_empty_value(value: Any) -> bool:
-    return value is None or (isinstance(value, str) and value.strip() == "")
-
-
-def normalize_json_text(raw_json: Any) -> str:
-    if raw_json is None:
-        raise ValueError("JSON vazio")
-    text = str(raw_json).strip().lstrip("\ufeff")
-    if not text:
-        raise ValueError("JSON vazio")
-    return text
-
-
-def parse_json_cell(raw_json: Any) -> Any:
-    text = normalize_json_text(raw_json)
+def configurar(env_path: Path) -> dict[str, str]:
+    if not env_path.is_file():
+        raise ConfiguracaoErro("Arquivo .env nao encontrado; informe --env com o caminho correto.")
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        repaired = repair_json_text(text)
-        if repaired != text:
+        valores = dotenv_values(env_path, encoding="utf-8-sig", interpolate=False)
+    except (OSError, UnicodeError):
+        raise ConfiguracaoErro("Nao foi possivel ler o .env como UTF-8.") from None
+    url = (valores.get("URL_SBK") or "").strip()
+    identificador = (valores.get("ID_TESTE") or "").strip()
+    try:
+        partes = urlsplit(url)
+        valido = (
+            partes.scheme in {"http", "https"}
+            and bool(partes.hostname)
+            and partes.username is None
+            and partes.password is None
+            and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url)
+            and "\\" not in url
+        )
+        _ = partes.port
+    except ValueError:
+        valido = False
+    if not valido:
+        raise ConfiguracaoErro("URL_SBK ausente ou invalida: use endereco HTTP(S), sem credenciais embutidas.")
+    if not identificador or len(identificador) > 256 or any(
+        ord(c) < 32 or ord(c) == 127 for c in identificador
+    ):
+        raise ConfiguracaoErro("ID_TESTE ausente ou invalido: use de 1 a 256 caracteres, sem controles.")
+    return {"URL_SBK": url, "ID_TESTE": identificador}
+
+
+class Sanitizador:
+    """Permite apenas termos estaticos conhecidos; todo o resto recebe alias."""
+
+    CAMINHOS = {"jdoc", "faces", "showjasperreportpdfservlet", "adf", "login"}
+    PARAMETROS = {"_rtrId", "_afrPage", "_afrLoop", "_afrWindowId", "_afrWindowMode"}
+
+    def __init__(self):
+        self.origens = {}
+        self.recursos = {}
+
+    def url(self, value: str | None) -> dict:
+        value = value or ""
+        recurso = self.recursos.setdefault(value, f"R{len(self.recursos) + 1:04d}")
+        try:
+            partes = urlsplit(value)
+            esquema = partes.scheme.lower()
+            if esquema not in {"http", "https", "blob", "data", "about", "chrome-extension", "edge"}:
+                esquema = "outro"
+            origem = None
+            caminho = "[oculto]"
+            parametros = []
+            if esquema in {"http", "https"}:
+                chave = (partes.scheme.lower(), partes.hostname, partes.port)
+                origem = self.origens.setdefault(chave, f"O{len(self.origens) + 1:03d}")
+                segmentos = [s.lower() if s.lower() in self.CAMINHOS else "*"
+                             for s in partes.path.split("/") if s]
+                caminho = "/" + "/".join(segmentos[:12])
+                if len(segmentos) > 12:
+                    caminho += "/..."
+                parametros = sorted({p.split("=", 1)[0] for p in partes.query.split("&")}
+                                    & self.PARAMETROS)
+            endereco = f"{esquema}://{origem or '[oculto]'}{caminho}"
+            return {"url": endereco, "esquema": esquema, "origem_id": origem,
+                    "recurso_id": recurso, "parametros_adf": parametros,
+                    "tem_query": bool(partes.query), "tem_fragmento": bool(partes.fragment)}
+        except (ValueError, TypeError):
+            return {"url": "[url_oculta]", "esquema": "outro", "origem_id": None,
+                    "recurso_id": recurso, "parametros_adf": [],
+                    "tem_query": False, "tem_fragmento": False}
+
+
+def numero(value):
+    value = str(value or "")
+    return int(value) if re.fullmatch(r"[0-9]{1,18}", value) else None
+
+
+def intervalo(value):
+    value = str(value or "").strip().lower()
+    return value if re.fullmatch(r"bytes(?:=\d*-\d*(?:,\s*\d*-\d*)*| (?:\d+-\d+|\*)/(?:\d+|\*))", value) else None
+
+
+def mime(value):
+    value = str(value or "").split(";", 1)[0].strip().lower()
+    permitidos = {"application/pdf", "application/octet-stream", "text/html",
+                  "application/json", "text/json", "text/plain", "application/xml",
+                  "text/xml", "text/javascript", "application/javascript"}
+    return value if value in permitidos else ("outro" if value else "ausente")
+
+
+class Coletor:
+    def __init__(self, log_path: Path):
+        # Modo exclusivo: um log anterior nunca e sobrescrito.
+        self.arquivo = log_path.open("x", encoding="utf-8", buffering=1)
+        self.sanitizador = Sanitizador()
+        self.inicio = time.monotonic()
+        self.ativo = False
+        self.paginas = {}
+        self.frames = {}
+        self.requisicoes = {}
+        self.pendentes = set()
+        self.ultimos_dom = {}
+        self.mimes_frames = {}
+        self.dom_omitidos = set()
+        self.contagens = {}
+        self.linhas = 0
+        self.limitado = False
+        self.context = None
+        self.encerrado = False
+        self.etapa = "inicializacao"
+
+    def registrar(self, evento, **dados):
+        if self.encerrado:
+            return
+        self.contagens[evento] = self.contagens.get(evento, 0) + 1
+        if evento == "javascript_erro" and self.contagens[evento] > 50:
+            if self.contagens[evento] == 51:
+                self.registrar("limite_eventos_javascript", limite=50)
+            return
+        if self.linhas >= 30000 and evento not in {"fim_diagnostico", "falha", "observacao_encerrada"}:
+            if not self.limitado:
+                self.limitado = True
+                self.arquivo.write(json.dumps({"evento": "limite_total_eventos", "limite": 30000}) + "\n")
+            return
+        linha = {"segundos": round(time.monotonic() - self.inicio, 3),
+                 "evento": evento, **dados}
+        self.arquivo.write(json.dumps(linha, ensure_ascii=True) + "\n")
+        self.linhas += 1
+
+    def marcar(self, etapa):
+        self.etapa = etapa
+        self.registrar("etapa", nome=etapa)
+        print(f"Etapa: {etapa}", flush=True)
+
+    def proteger(self, nome, funcao):
+        def callback(*args):
             try:
-                return json.loads(repaired)
-            except json.JSONDecodeError:
+                funcao(*args)
+            except Exception as erro:
+                # Excecoes Playwright podem conter URLs, valores e trechos HTML.
+                self.registrar("observador_indisponivel", observador=nome,
+                               classe=type(erro).__name__)
+        return callback
+
+    def frame_id(self, frame):
+        if frame is None:
+            return None
+        return self.frames.setdefault(frame, f"F{len(self.frames) + 1:03d}")
+
+    def pagina_id(self, page):
+        return self.paginas.setdefault(page, f"P{len(self.paginas) + 1:03d}")
+
+    def observar_frame(self, evento, frame):
+        self.registrar(evento, frame_id=self.frame_id(frame),
+                       pagina_id=self.pagina_id(frame.page),
+                       pai_id=self.frame_id(frame.parent_frame),
+                       endereco=self.sanitizador.url(frame.url))
+
+    def observar_pagina(self, page):
+        if page in self.paginas:
+            return
+        pagina_id = self.pagina_id(page)
+        opener = page.opener()
+        self.registrar("pagina", pagina_id=pagina_id,
+                       origem_pagina_id=self.pagina_id(opener) if opener else None,
+                       endereco=self.sanitizador.url(page.url))
+        for evento in ("frameattached", "framenavigated", "framedetached"):
+            page.on(evento, self.proteger(evento, lambda frame, ev=evento: self.observar_frame(ev, frame)))
+        page.on("download", self.proteger("download", lambda download: self.registrar(
+            "download_iniciado", pagina_id=pagina_id,
+            endereco=self.sanitizador.url(download.url))))
+        page.on("close", lambda: self.registrar("pagina_fechada", pagina_id=pagina_id))
+        page.on("pageerror", lambda _erro: self.registrar("javascript_erro", pagina_id=pagina_id))
+        page.on("crash", lambda: self.registrar("pagina_crash", pagina_id=pagina_id))
+        for frame in page.frames:
+            self.observar_frame("frame_inicial", frame)
+
+    def instalar(self, context):
+        self.context = context
+        context.on("page", self.proteger("page", self.observar_pagina))
+        for page in context.pages:
+            self.observar_pagina(page)
+        for evento, handler in (("request", self.requisicao), ("response", self.resposta),
+                                ("requestfinished", self.finalizada), ("requestfailed", self.falhou)):
+            context.on(evento, self.proteger(evento, handler))
+
+    def iniciar_exportacao(self):
+        self.ativo = True
+        self.registrar("inicio_captura_rede", limite_requisicoes=10000)
+        self.marcar("exportacao")
+
+    def requisicao(self, request):
+        if not self.ativo or request in self.requisicoes:
+            return
+        if len(self.requisicoes) >= 10000:
+            if not self.contagens.get("limite_requisicoes"):
+                self.registrar("limite_requisicoes", limite=10000)
+            return
+        rid = f"Q{len(self.requisicoes) + 1:05d}"
+        self.requisicoes[request] = rid
+        self.pendentes.add(rid)
+        try:
+            frame = request.frame
+        except PlaywrightErro:
+            frame = None
+        # Estes valores existem apenas transitoriamente; o log recebe allowlist.
+        headers = request.all_headers()
+        self.registrar("requisicao", requisicao_id=rid, metodo=request.method,
+                       tipo=request.resource_type, navegacao=request.is_navigation_request(),
+                       frame_id=self.frame_id(frame),
+                       pagina_id=self.pagina_id(frame.page) if frame else None,
+                       endereco=self.sanitizador.url(request.url),
+                       redirecionada_de=self.requisicoes.get(request.redirected_from),
+                       cookie_presente=bool(headers.get("cookie")),
+                       authorization_presente=bool(headers.get("authorization")),
+                       csrf_header_presente=any(k in headers for k in ("x-csrf-token", "x-xsrf-token", "csrf-token")),
+                       referer=self.sanitizador.url(headers["referer"]) if headers.get("referer") else None,
+                       range=intervalo(headers.get("range")))
+
+    def resposta(self, response):
+        request = response.request
+        h = response.headers
+        # Guardar apenas MIME da navegacao, inclusive durante o login. Nao avaliar
+        # DOM de renderer PDF/visualizador: pode nunca responder a evaluate().
+        if request.resource_type == "document":
+            try:
+                self.mimes_frames[request.frame] = mime(h.get("content-type"))
+            except PlaywrightErro:
+                pass
+        if not self.ativo:
+            return
+        if request not in self.requisicoes:
+            self.requisicao(request)
+        rid = self.requisicoes.get(request)
+        if not rid:
+            return
+        disposition = h.get("content-disposition", "").split(";", 1)[0].strip().lower()
+        encoding = h.get("content-encoding", "").strip().lower()
+        self.registrar("resposta", requisicao_id=rid, status=response.status,
+                       endereco=self.sanitizador.url(response.url),
+                       content_type=mime(h.get("content-type")),
+                       content_length=numero(h.get("content-length")),
+                       content_range=intervalo(h.get("content-range")),
+                       accept_ranges=h.get("accept-ranges", "").lower() == "bytes",
+                       content_encoding=encoding if encoding in {"", "identity", "gzip", "br", "deflate", "zstd"} else "outro",
+                       transfer_chunked="chunked" in h.get("transfer-encoding", "").lower(),
+                       disposition=disposition if disposition in {"inline", "attachment"} else "ausente_ou_outro",
+                       filename_presente="filename" in h.get("content-disposition", "").lower(),
+                       location=self.sanitizador.url(urljoin(response.url, h["location"])) if h.get("location") else None,
+                       via_service_worker=bool(response.from_service_worker))
+
+    def finalizada(self, request):
+        if not self.ativo:
+            return
+        rid = self.requisicoes.get(request)
+        if not rid:
+            return
+        self.pendentes.discard(rid)
+        try:
+            tamanhos = request.sizes()
+        except PlaywrightErro:
+            tamanhos = {}
+        self.registrar("requisicao_concluida", requisicao_id=rid,
+                       bytes_resposta_codificados=tamanhos.get("responseBodySize"),
+                       bytes_requisicao=tamanhos.get("requestBodySize"))
+
+    def falhou(self, request):
+        if not self.ativo:
+            return
+        rid = self.requisicoes.get(request)
+        if not rid:
+            return
+        self.pendentes.discard(rid)
+        failure = request.failure or ""
+        # Somente codigos Chromium, nunca o texto livre de uma excecao.
+        codigo = failure if re.fullmatch(r"net::ERR_[A-Z_0-9]+", failure) else "erro_omitido"
+        self.registrar("requisicao_falhou", requisicao_id=rid, codigo=codigo)
+
+    def inspecionar_dom(self):
+        for page in list(self.context.pages):
+            for frame in list(page.frames):
+                if (self.mimes_frames.get(frame) != "text/html"
+                        or not frame.url.startswith(("http://", "https://"))):
+                    if frame not in self.dom_omitidos:
+                        self.dom_omitidos.add(frame)
+                        self.registrar("inspecao_dom_omitida", frame_id=self.frame_id(frame),
+                                       pagina_id=self.pagina_id(page),
+                                       motivo="frame_sem_navegacao_html_observada", endereco=self.sanitizador.url(frame.url))
+                    continue
+                try:
+                    dados = frame.evaluate("""() => ({
+                        frameset: !!document.querySelector('frameset'),
+                        adf_loopback: typeof window.AdfLoopbackUtils !== 'undefined',
+                        janela_nomeada: !!window.name,
+                        elementos: Array.from(document.querySelectorAll('frame,iframe,embed,object'))
+                            .slice(0, 50).map(e => ({tag: e.tagName.toLowerCase(),
+                                url: e.tagName === 'OBJECT' ? e.data : e.src}))
+                    })""")
+                    seguro = {"frame_id": self.frame_id(frame),
+                              "pagina_id": self.pagina_id(page),
+                              "pai_id": self.frame_id(frame.parent_frame),
+                              "frameset": dados["frameset"],
+                              "adf_loopback": dados["adf_loopback"], "janela_nomeada": dados["janela_nomeada"],
+                              "endereco": self.sanitizador.url(frame.url),
+                              "elementos": [{"tag": e["tag"], "endereco": self.sanitizador.url(e["url"])}
+                                            for e in dados["elementos"]]}
+                    chave = json.dumps(seguro, sort_keys=True)
+                    if self.ultimos_dom.get(frame) != chave:
+                        self.ultimos_dom[frame] = chave
+                        self.registrar("estrutura_visualizador", **seguro)
+                except PlaywrightErro:
+                    pass  # Frame pode navegar/fechar durante a observacao.
+
+    def fechar(self, motivo):
+        if self.encerrado:
+            return
+        self.registrar("fim_diagnostico", motivo=motivo, etapa=self.etapa,
+                       requisicoes_pendentes=sorted(self.pendentes),
+                       contagens=dict(self.contagens), pdf_validado=False)
+        self.encerrado = True
+        self.arquivo.close()
+
+
+def solicitar_token():
+    resultado = {"valor": ""}
+    janela = tk.Tk()
+    janela.title("SBK - Dupla Autenticacao")
+    janela.geometry("500x220")
+    janela.resizable(False, False)
+    tk.Label(janela, text="Dupla Autenticacao", font=("Segoe UI", 12, "bold")).pack(pady=(20, 10))
+    tk.Label(janela, text="Digite o token recebido por e-mail para continuar.", wraplength=450).pack()
+    entrada = ttk.Entry(janela, width=35, justify="center", show="*")
+    entrada.pack(pady=15)
+    entrada.focus()
+
+    def confirmar():
+        valor = entrada.get().strip()
+        if valor:
+            resultado["valor"] = valor
+            janela.destroy()
+
+    ttk.Button(janela, text="Confirmar", command=confirmar).pack()
+    janela.bind("<Return>", lambda _event: confirmar())
+    janela.mainloop()
+    if not resultado["valor"]:
+        raise ConfiguracaoErro("Entrada do token cancelada.")
+    return resultado["valor"]
+
+
+def executar(config, coletor, espera):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(channel="msedge", headless=False,
+            args=["--disable-popup-blocking", "--allow-popups-during-page-unload"])
+        browser.on("disconnected", lambda: coletor.registrar("navegador_desconectado"))
+        try:
+            coletor.registrar("ambiente", python=sys.version.split()[0],
+                               playwright=version("playwright"), navegador=browser.version,
+                               tls_verificado=True, interceptacao=False)
+            context = browser.new_context(accept_downloads=True)
+            context.set_default_timeout(30000)
+            context.set_default_navigation_timeout(120000)
+            coletor.instalar(context)
+            page = context.new_page()
+            coletor.marcar("abrir_site_login_manual")
+            page.goto(config["URL_SBK"], wait_until="domcontentloaded")
+            print("Realize o login normalmente. Aguarde a janela para informar o token.", flush=True)
+            page.wait_for_selector("#duplaAutenticacao\\:\\:\\:content", timeout=120000)
+            token = solicitar_token()
+            page.fill("#duplaAutenticacao\\:\\:\\:content", token)
+            del token
+            autenticar = page.locator("#b4 a")
+            if autenticar.count() and autenticar.first.is_visible():
+                autenticar.first.click()
+            else:
+                page.get_by_text("Autenticar", exact=True).click()
+            # A tela seguinte confirma que o fluxo avancou; networkidle nao prova login.
+            coletor.marcar("selecionar_cliente")
+            page.locator("#pt1\\:\\:sorTipoPesquisa\\:\\:_1").click(timeout=120000)
+            page.wait_for_timeout(1000)
+            coletor.marcar("preencher_identificador")
+            page.fill("#pt1\\:\\:itTipoPesquisaItem\\:\\:\\:content", config["ID_TESTE"])
+            page.wait_for_timeout(1000)
+            coletor.marcar("pesquisar_documento")
+            page.click("#pt1\\:\\:btPesquisarDocumento")
+            page.wait_for_timeout(5000)
+            coletor.marcar("selecionar_documentos")
+            chk1 = "#pt1\\:\\:pc1\\:\\:t1\\:\\:sbcSelectAllDoc\\:\\:\\:content"
+            page.wait_for_selector(chk1, timeout=15000)
+            page.wait_for_timeout(2000)
+            page.locator(chk1).set_checked(True)
+            page.wait_for_timeout(2000)
+            coletor.marcar("confirmar_filtro")
+            page.locator("#pt1\\:\\:pc1\\:\\:btConfirmarFiltro > a").click(timeout=15000)
+            coletor.marcar("selecionar_detalhes")
+            chk2 = "#pt1\\:\\:pcIPD\\:\\:t3\\:\\:sbcSelectAllDocDet\\:\\:\\:content"
+            page.wait_for_selector(chk2, timeout=15000)
+            page.wait_for_timeout(2000)
+            page.locator(chk2).set_checked(True)
+            page.wait_for_timeout(3000)
+            exportar = page.locator("#pt1\\:\\:pcIPD\\:\\:btDownloadImgSelect > a")
+            exportar.wait_for(timeout=15000)
+            page.wait_for_timeout(3000)
+            exportar.scroll_into_view_if_needed()
+            coletor.iniciar_exportacao()
+            inicio_exportacao = time.monotonic()
+            exportar.click(no_wait_after=True)
+            print("Observando a exportacao. Nao clique novamente em Exportar.", flush=True)
+            print("Apos o PDF carregar, voce pode encerrar com Ctrl+C neste terminal.", flush=True)
+            proximo_dom = 0
+            proximo_aviso = 0
+            while time.monotonic() - inicio_exportacao < espera:
+                decorrido = time.monotonic() - inicio_exportacao
+                if decorrido >= proximo_dom:
+                    coletor.inspecionar_dom()
+                    proximo_dom = decorrido + 5
+                if decorrido >= proximo_aviso:
+                    print(f"Observacao: {int(decorrido)}s; respostas: {coletor.contagens.get('resposta', 0)}; "
+                          f"downloads iniciados: {coletor.contagens.get('download_iniciado', 0)}", flush=True)
+                    proximo_aviso = decorrido + 30
+                if not browser.is_connected() or not context.pages:
+                    return "navegador_fechado"
+                # Espera diagnostica: entrega controle ao dispatcher sync do Playwright.
+                context.pages[0].wait_for_timeout(250)
+            return "prazo_observacao_encerrado"
+        finally:
+            # Snapshot antes do fechamento. O chamador ainda precisa registrar
+            # eventuais excecoes e o motivo real antes de fechar o arquivo.
+            coletor.registrar("observacao_encerrada", etapa=coletor.etapa,
+                               requisicoes_pendentes=sorted(coletor.pendentes))
+            coletor.ativo = False
+            try:
+                browser.close()
+            except PlaywrightErro:
                 pass
 
-        try:
-            return ast.literal_eval(text)
-        except (ValueError, SyntaxError):
-            if repaired != text:
-                return ast.literal_eval(repaired)
-            raise
 
-
-def repair_json_text(text: str) -> str:
-    repaired = text
-    repaired = re.sub(r"\bNone\b", "null", repaired)
-    repaired = re.sub(r"\bTrue\b", "true", repaired)
-    repaired = re.sub(r"\bFalse\b", "false", repaired)
-    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
-    repaired = re.sub(
-        r'("value"\s*:\s*)(?!["{\[\]}\d\-]|true\b|false\b|null\b)([^,\]}]+)',
-        quote_unquoted_json_value,
-        repaired,
-        flags=re.IGNORECASE,
-    )
-    return repaired
-
-
-def quote_unquoted_json_value(match: re.Match[str]) -> str:
-    prefix = match.group(1)
-    value = match.group(2).strip()
-    if not value:
-        return f'{prefix}""'
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'{prefix}"{escaped}"'
-
-
-def iter_root_items(parsed_json: Any) -> Iterable[tuple[str, Any]]:
-    if isinstance(parsed_json, dict):
-        for root_key, root_value in parsed_json.items():
-            if isinstance(root_value, list):
-                for item in root_value:
-                    yield str(root_key), item
-            else:
-                yield str(root_key), root_value
-        return
-
-    if isinstance(parsed_json, list):
-        for item in parsed_json:
-            yield "JSON", item
-        return
-
-    yield "JSON", parsed_json
-
-
-def extract_item_title(item: Any, service_title_key: str) -> str:
-    if isinstance(item, dict):
-        title = item.get(service_title_key)
-        if not is_empty_value(title):
-            return str(title).strip()
-        for fallback_key in ("title", "label", "name", "campo"):
-            fallback_title = item.get(fallback_key)
-            if not is_empty_value(fallback_title):
-                return str(fallback_title).strip()
-    return "Valor"
-
-
-def extract_item_value(item: Any) -> Any:
-    if isinstance(item, dict):
-        for key in ("value", "valor", "Value", "VALOR"):
-            if key in item:
-                return sanitize_cell_value(item.get(key))
-        compact = {key: value for key, value in item.items() if key not in {DEFAULT_SERVICE_TITLE_KEY, "title", "label", "name"}}
-        return sanitize_cell_value(json.dumps(compact, ensure_ascii=False)) if compact else EMPTY_VALUE
-    return sanitize_cell_value(item)
-
-
-def flatten_json_fields(parsed_json: Any, service_title_key: str) -> dict[str, OrderedDict[str, Any]]:
-    fields: dict[str, OrderedDict[str, Any]] = OrderedDict()
-    for root_key, item in iter_root_items(parsed_json):
-        root_fields = fields.setdefault(root_key, OrderedDict())
-        column_title = extract_item_title(item, service_title_key)
-        value = extract_item_value(item)
-        root_fields[column_title] = value
-    return fields
-
-
-def choose_service_title(parsed_json: Any, fields: dict[str, OrderedDict[str, Any]], service_title_key: str) -> str:
-    if isinstance(parsed_json, dict):
-        direct = parsed_json.get(service_title_key)
-        if isinstance(direct, str) and direct.strip():
-            return direct.strip()
-
-    key_lower = service_title_key.strip().lower()
-    for _, item in iter_root_items(parsed_json):
-        if isinstance(item, dict):
-            for marker_key in ("titulo", "title", "label", "name", "campo"):
-                marker = item.get(marker_key)
-                if isinstance(marker, str) and marker.strip().lower() == key_lower:
-                    item_value = extract_item_value(item)
-                    if item_value != EMPTY_VALUE:
-                        return str(item_value)
-
-    for root_fields in fields.values():
-        for column_title in root_fields.keys():
-            if column_title != "Valor":
-                return column_title
-    return "Sem Título"
-
-
-def safe_sheet_title(title: str, used_titles: set[str]) -> str:
-    cleaned = re.sub(r"[\[\]\:\*\?\/\\]", " ", str(title)).strip() or "Sem Título"
-    cleaned = re.sub(r"\s+", " ", cleaned)[:MAX_SHEET_TITLE_LENGTH].strip() or "Sem Título"
-    candidate = cleaned
-    index = 2
-    while candidate in used_titles:
-        suffix = f" {index}"
-        candidate = f"{cleaned[: MAX_SHEET_TITLE_LENGTH - len(suffix)]}{suffix}".strip()
-        index += 1
-    used_titles.add(candidate)
-    return candidate
-
-
-def header_fill_for(root_index: int) -> PatternFill:
-    color = HEADER_GROUP_COLORS[root_index % len(HEADER_GROUP_COLORS)]
-    return PatternFill("solid", fgColor=color)
-
-
-def read_input_rows(config: ProcessConfig, progress_callback: ProgressCallback | None = None) -> dict[str, SheetDataset]:
-    workbook = load_workbook(config.input_path, read_only=True, data_only=True)
-    worksheet = workbook.active
-
-    headers = [cell.value for cell in next(worksheet.iter_rows(min_row=1, max_row=1))]
-    header_map = {str(header).strip(): index for index, header in enumerate(headers) if header is not None}
-    if config.json_column_name not in header_map:
-        raise ValueError(f'Coluna JSON "{config.json_column_name}" não encontrada.')
-    if config.number_column_name not in header_map:
-        raise ValueError(f'Coluna "{config.number_column_name}" não encontrada.')
-
-    json_index = header_map[config.json_column_name]
-    number_index = header_map[config.number_column_name]
-    total_rows = max(worksheet.max_row - 1, 0)
-    datasets: dict[str, SheetDataset] = {}
-
-    for processed, row in enumerate(worksheet.iter_rows(min_row=2, values_only=True), start=1):
-        number = row[number_index] if number_index < len(row) else None
-        raw_json = row[json_index] if json_index < len(row) else None
-
-        try:
-            parsed_json = parse_json_cell(raw_json)
-            fields = flatten_json_fields(parsed_json, config.service_title_key)
-            service_title = choose_service_title(parsed_json, fields, config.service_title_key)
-        except Exception:
-            service_title = ERROR_SHEET
-            fields = OrderedDict({"Erro": OrderedDict({"Status": JSON_ERROR_VALUE})})
-
-        datasets.setdefault(service_title, SheetDataset(service_title)).add_row(number, raw_json, fields)
-
-        if progress_callback:
-            progress_callback(processed, total_rows)
-
-    workbook.close()
-    return datasets
-
-
-def build_output_workbook(datasets: dict[str, SheetDataset], output_path: Path) -> None:
-    workbook = Workbook(write_only=False)
-    default_sheet = workbook.active
-    workbook.remove(default_sheet)
-
-    used_titles: set[str] = set()
-    for service_title in sorted(datasets.keys(), key=lambda value: value.casefold()):
-        dataset = datasets[service_title]
-        worksheet = workbook.create_sheet(safe_sheet_title(service_title, used_titles))
-        worksheet.freeze_panes = "A2"
-
-        columns: list[tuple[str, str | None]] = [
-            (DEFAULT_NUMBER_COLUMN, None),
-            (DEFAULT_JSON_COLUMN, None),
-        ]
-        for root_key, root_columns in dataset.root_columns.items():
-            for column_title in root_columns.keys():
-                columns.append((column_title, root_key))
-
-        worksheet.append([column_title for column_title, _ in columns])
-        style_header(worksheet, columns)
-
-        for row_data in dataset.rows:
-            values = [row_data[DEFAULT_NUMBER_COLUMN], row_data[DEFAULT_JSON_COLUMN]]
-            fields = row_data["fields"]
-            for column_title, root_key in columns[2:]:
-                value = fields.get(root_key, {}).get(column_title, EMPTY_VALUE)
-                values.append(sanitize_cell_value(value))
-            worksheet.append(values)
-
-        style_data_cells(worksheet)
-        auto_adjust_widths(worksheet)
-
-    workbook.save(output_path)
-    workbook.close()
-
-
-def style_header(worksheet: Any, columns: list[tuple[str, str | None]]) -> None:
-    root_order: dict[str, int] = {}
-
-    for col_idx, (_, root_key) in enumerate(columns, start=1):
-        cell = worksheet.cell(row=1, column=col_idx)
-        cell.font = Font(bold=True, color="1F2933")
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
-        worksheet.row_dimensions[1].height = DATA_ROW_HEIGHT
-
-        if root_key is None:
-            cell.fill = PatternFill("solid", fgColor="D6DBDF")
-            continue
-
-        root_order.setdefault(root_key, len(root_order))
-        cell.fill = header_fill_for(root_order[root_key])
-
-
-def style_data_cells(worksheet: Any) -> None:
-    empty_fill = PatternFill("solid", fgColor="FADBD8")
-    empty_font = Font(color="78281F")
-    error_font = Font(bold=True, color="FF0000")
-
-    for row in worksheet.iter_rows(min_row=2):
-        worksheet.row_dimensions[row[0].row].height = DATA_ROW_HEIGHT
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=False)
-            if cell.value == EMPTY_VALUE:
-                cell.fill = empty_fill
-                cell.font = empty_font
-            elif cell.value == JSON_ERROR_VALUE:
-                cell.font = error_font
-
-
-def auto_adjust_widths(worksheet: Any) -> None:
-    for header_cell in worksheet[1]:
-        column_letter = get_column_letter(header_cell.column)
-        header_text = "" if header_cell.value is None else str(header_cell.value)
-        width = min(max(len(header_text) + 4, MIN_COLUMN_WIDTH), MAX_COLUMN_WIDTH)
-        worksheet.column_dimensions[column_letter].width = width
-
-
-def process_excel(config: ProcessConfig, progress_callback: ProgressCallback | None = None) -> None:
-    datasets = read_input_rows(config, progress_callback)
-    build_output_workbook(datasets, config.output_path)
-
-
-class ExcelJsonSplitterApp:
-    def __init__(self) -> None:
-        self.ctk_enabled = ctk is not None
-        self.queue: Queue[tuple[str, Any]] = Queue()
-
-        if self.ctk_enabled:
-            ctk.set_appearance_mode("system")
-            ctk.set_default_color_theme("blue")
-            self.root = ctk.CTk()
-        else:
-            self.root = tk.Tk()
-
-        self.root.title("Extrator JSON para Excel")
-        self.root.geometry("820x520")
-        self.root.minsize(760, 480)
-
-        self.input_path = tk.StringVar(master=self.root)
-        self.output_path = tk.StringVar(master=self.root)
-        self.json_column_name = tk.StringVar(master=self.root, value=DEFAULT_JSON_COLUMN)
-        self.service_title_key = tk.StringVar(master=self.root, value=DEFAULT_SERVICE_TITLE_KEY)
-        self.status_text = tk.StringVar(master=self.root, value="Selecione um arquivo Excel para começar.")
-        self.progress_text = tk.StringVar(master=self.root, value="0%")
-
-        self._build_ui()
-        self.root.after(150, self._poll_queue)
-
-    def _build_ui(self) -> None:
-        if self.ctk_enabled:
-            frame = ctk.CTkFrame(self.root, corner_radius=8)
-            frame.pack(fill="both", expand=True, padx=24, pady=24)
-            self._build_ctk_ui(frame)
-        else:
-            frame = ttk.Frame(self.root, padding=24)
-            frame.pack(fill="both", expand=True)
-            self._build_tk_ui(frame)
-
-    def _build_ctk_ui(self, frame: Any) -> None:
-        ctk.CTkLabel(frame, text="Extrator JSON para Excel", font=ctk.CTkFont(size=24, weight="bold")).pack(anchor="w")
-        ctk.CTkLabel(frame, text="Processamento offline com abas por título de serviço.").pack(anchor="w", pady=(4, 20))
-        self._ctk_file_row(frame, "Arquivo de entrada", self.input_path, "Selecionar Excel", self.select_input_file)
-        self._ctk_file_row(frame, "Arquivo de saída", self.output_path, "Salvar Como...", self.select_output_file)
-        self._ctk_entry(frame, "Nome da Coluna JSON", self.json_column_name)
-        self._ctk_entry(frame, "Chave do Título do Serviço no JSON", self.service_title_key)
-        self.progress_bar = ctk.CTkProgressBar(frame)
-        self.progress_bar.set(0)
-        self.progress_bar.pack(fill="x", pady=(20, 8))
-        ctk.CTkLabel(frame, textvariable=self.progress_text).pack(anchor="w")
-        ctk.CTkLabel(frame, textvariable=self.status_text, wraplength=740).pack(anchor="w", pady=(8, 18))
-        self.start_button = ctk.CTkButton(frame, text="Iniciar Processamento", command=self.start_processing)
-        self.start_button.pack(anchor="e")
-
-    def _ctk_file_row(self, parent: Any, label: str, variable: tk.StringVar, button_text: str, command: Callable[[], None]) -> None:
-        ctk.CTkLabel(parent, text=label).pack(anchor="w")
-        row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", pady=(4, 12))
-        ctk.CTkEntry(row, textvariable=variable).pack(side="left", fill="x", expand=True, padx=(0, 10))
-        ctk.CTkButton(row, text=button_text, width=150, command=command).pack(side="right")
-
-    def _ctk_entry(self, parent: Any, label: str, variable: tk.StringVar) -> None:
-        ctk.CTkLabel(parent, text=label).pack(anchor="w")
-        ctk.CTkEntry(parent, textvariable=variable).pack(fill="x", pady=(4, 12))
-
-    def _build_tk_ui(self, frame: ttk.Frame) -> None:
-        ttk.Label(frame, text="Extrator JSON para Excel", font=("Segoe UI", 18, "bold")).pack(anchor="w")
-        ttk.Label(frame, text="Processamento offline com abas por título de serviço.").pack(anchor="w", pady=(4, 20))
-        self._tk_file_row(frame, "Arquivo de entrada", self.input_path, "Selecionar Excel", self.select_input_file)
-        self._tk_file_row(frame, "Arquivo de saída", self.output_path, "Salvar Como...", self.select_output_file)
-        self._tk_entry(frame, "Nome da Coluna JSON", self.json_column_name)
-        self._tk_entry(frame, "Chave do Título do Serviço no JSON", self.service_title_key)
-        self.progress_bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
-        self.progress_bar.pack(fill="x", pady=(20, 8))
-        ttk.Label(frame, textvariable=self.progress_text).pack(anchor="w")
-        ttk.Label(frame, textvariable=self.status_text, wraplength=740).pack(anchor="w", pady=(8, 18))
-        self.start_button = ttk.Button(frame, text="Iniciar Processamento", command=self.start_processing)
-        self.start_button.pack(anchor="e")
-
-    def _tk_file_row(self, parent: ttk.Frame, label: str, variable: tk.StringVar, button_text: str, command: Callable[[], None]) -> None:
-        ttk.Label(parent, text=label).pack(anchor="w")
-        row = ttk.Frame(parent)
-        row.pack(fill="x", pady=(4, 12))
-        ttk.Entry(row, textvariable=variable).pack(side="left", fill="x", expand=True, padx=(0, 10))
-        ttk.Button(row, text=button_text, command=command).pack(side="right")
-
-    def _tk_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar) -> None:
-        ttk.Label(parent, text=label).pack(anchor="w")
-        ttk.Entry(parent, textvariable=variable).pack(fill="x", pady=(4, 12))
-
-    def select_input_file(self) -> None:
-        selected = filedialog.askopenfilename(filetypes=[("Arquivos Excel", "*.xlsx")])
-        if selected:
-            self.input_path.set(selected)
-            if not self.output_path.get():
-                source = Path(selected)
-                self.output_path.set(str(source.with_name(f"{source.stem}_processado.xlsx")))
-
-    def select_output_file(self) -> None:
-        selected = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Arquivos Excel", "*.xlsx")],
-        )
-        if selected:
-            self.output_path.set(selected)
-
-    def start_processing(self) -> None:
-        try:
-            config = self._read_config()
-        except ValueError as exc:
-            messagebox.showwarning("Configuração incompleta", str(exc))
-            return
-
-        self._set_processing_state(True)
-        self.status_text.set("Processando...")
-        worker = threading.Thread(target=self._run_worker, args=(config,), daemon=True)
-        worker.start()
-
-    def _read_config(self) -> ProcessConfig:
-        input_path = Path(self.input_path.get())
-        output_path = Path(self.output_path.get())
-        json_column = self.json_column_name.get().strip()
-        service_key = self.service_title_key.get().strip()
-
-        if not input_path.is_file():
-            raise ValueError("Selecione um arquivo Excel de entrada válido.")
-        if input_path.suffix.lower() != ".xlsx":
-            raise ValueError("O arquivo de entrada deve estar no formato .xlsx.")
-        if not output_path:
-            raise ValueError("Escolha onde salvar o arquivo processado.")
-        if output_path.suffix.lower() != ".xlsx":
-            raise ValueError("O arquivo de saída deve estar no formato .xlsx.")
-        if not json_column:
-            raise ValueError("Informe o nome da coluna JSON.")
-        if not service_key:
-            raise ValueError("Informe a chave do título do serviço no JSON.")
-
-        return ProcessConfig(input_path=input_path, output_path=output_path, json_column_name=json_column, service_title_key=service_key)
-
-    def _run_worker(self, config: ProcessConfig) -> None:
-        def progress(processed: int, total: int) -> None:
-            self.queue.put(("progress", (processed, total)))
-
-        try:
-            process_excel(config, progress)
-            self.queue.put(("done", str(config.output_path)))
-        except Exception as exc:
-            self.queue.put(("error", f"{exc}\n\n{traceback.format_exc()}"))
-
-    def _poll_queue(self) -> None:
-        try:
-            while True:
-                event, payload = self.queue.get_nowait()
-                if event == "progress":
-                    self._update_progress(*payload)
-                elif event == "done":
-                    self._set_processing_state(False)
-                    self.status_text.set(f"Arquivo gerado com sucesso: {payload}")
-                    messagebox.showinfo("Processamento concluído", f"Arquivo gerado com sucesso:\n{payload}")
-                elif event == "error":
-                    self._set_processing_state(False)
-                    self.status_text.set("Falha no processamento. Verifique a mensagem de erro.")
-                    messagebox.showerror("Erro no processamento", payload)
-        except Empty:
-            pass
-        self.root.after(150, self._poll_queue)
-
-    def _update_progress(self, processed: int, total: int) -> None:
-        percent = int((processed / total) * 100) if total else 100
-        if self.ctk_enabled:
-            self.progress_bar.set(percent / 100)
-        else:
-            self.progress_bar["value"] = percent
-        self.progress_text.set(f"{percent}%")
-        self.status_text.set(f"Processando linha {processed:,} de {total:,} ({percent}%)".replace(",", "."))
-
-    def _set_processing_state(self, processing: bool) -> None:
-        state = "disabled" if processing else "normal"
-        if self.ctk_enabled:
-            self.start_button.configure(state=state)
-        else:
-            self.start_button["state"] = state
-
-    def run(self) -> None:
-        self.root.mainloop()
-
-
-def main() -> None:
-    app = ExcelJsonSplitterApp()
-    app.run()
+def main():
+    parser = argparse.ArgumentParser(description="Observa uma exportacao SBK sem ler corpos nem validar o PDF.")
+    parser.add_argument("--env", type=Path, default=Path(__file__).with_name(".env"))
+    parser.add_argument("--espera", type=int, default=600, help="Segundos de observacao apos exportar (30 a 3600).")
+    args = parser.parse_args()
+    if not 30 <= args.espera <= 3600:
+        parser.error("--espera deve estar entre 30 e 3600 segundos.")
+    try:
+        config = configurar(args.env)
+    except ConfiguracaoErro as erro:
+        print(f"Configuracao: {erro}", file=sys.stderr)
+        return 2
+    destino = Path(__file__).with_name(datetime.now().strftime("diagnostico_sbk_%Y%m%d_%H%M%S_%f.jsonl"))
+    try:
+        coletor = Coletor(destino)
+    except OSError:
+        print("Nao foi possivel criar o log; extraia o pacote em uma pasta com permissao de escrita.", file=sys.stderr)
+        return 2
+    codigo = 0
+    try:
+        motivo = executar(config, coletor, args.espera)
+    except KeyboardInterrupt:
+        motivo = "interrupcao_manual"
+    except Exception as erro:
+        # Nao imprimir str(erro), pois pode conter URL, token, identificador ou HTML.
+        coletor.registrar("falha", etapa=coletor.etapa, classe=type(erro).__name__,
+                           timeout=isinstance(erro, PlaywrightTimeout))
+        print(f"Diagnostico interrompido na etapa {coletor.etapa} ({type(erro).__name__}).", flush=True)
+        motivo = "falha"
+        codigo = 1
+    finally:
+        coletor.fechar(locals().get("motivo", "fim"))
+    print(f"Log sanitizado: {destino.name}", flush=True)
+    print("Coleta encerrada. A integridade e o download do PDF ainda NAO foram comprovados.", flush=True)
+    return codigo
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
