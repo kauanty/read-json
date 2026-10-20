@@ -1,7 +1,9 @@
+
 from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 from collections import Counter, deque
 import concurrent.futures
 from contextlib import ExitStack, suppress
@@ -58,7 +60,7 @@ def configurar(env_path: Path) -> dict[str, str]:
     return {"URL_SBK": url, "ID_TESTE": identificador}
 
 
-def numero(value):
+def numero_ou_none(value):
     value = str(value or "")
     return int(value) if re.fullmatch(r"[0-9]{1,18}", value) else None
 
@@ -323,8 +325,12 @@ class CapturaOriginal:
     somente Content-Disposition. Nao ha GET adicional, leitura do corpo pelo
     Python, impressao nem reconstrucao do PDF. A transferencia e nativa.
     """
-    def __init__(self, monitor):
+    def __init__(self, monitor, modo='corpo', pasta=None, timeout_corpo=1200):
         self.monitor = monitor
+        self.modo = modo                  # 'corpo' (padrao) ou 'download'
+        self.pasta = Path(pasta) if pasta else None
+        self.timeout_corpo = timeout_corpo
+        self.corpos = deque()             # PDFs salvos pelo CDP (append/popleft sao atomicos)
         self.ws = None
         self.leitor = None
         self.sequencia = 0
@@ -371,7 +377,7 @@ class CapturaOriginal:
         # Endpoint criado exclusivamente pelo perfil temporario deste processo.
         # Conexao local sem proxy. O endpoint e os headers nunca sao registrados.
         self.ws = await connect(endpoint, proxy=None, compression=None,
-            max_size=4 * 1024 * 1024, max_queue=16, open_timeout=10, close_timeout=5)
+            max_size=1024 * 1024 * 1024, max_queue=16, open_timeout=10, close_timeout=5)
         self.leitor = asyncio.create_task(self.receber())
         # Verificar identidade antes de observar alvos ou alterar respostas.
         if contextos_esperados is not None:
@@ -453,25 +459,61 @@ class CapturaOriginal:
                 if not future.done():
                     future.set_exception(ProtocoloErro('CANAL_CDP_FECHADO'))
 
+    async def salvar_corpo(self, session, request_id, status, h, numero):
+        """Le o corpo da PROPRIA resposta pausada (sem 2o GET) e grava em disco."""
+        destino = self.pasta / f'sbk_corpo_{numero:04d}.part'
+        try:
+            r = await self.comando('Fetch.getResponseBody', {'requestId': request_id},
+                                   session, timeout=self.timeout_corpo)
+            if not r.get('base64Encoded'):
+                raise ProtocoloErro('CORPO_NAO_BINARIO')
+            dados = base64.b64decode(r.get('body', ''))
+            await asyncio.to_thread(destino.write_bytes, dados)
+            self.corpos.append({'arquivo': str(destino), 'numero': numero, 'http': {
+                'requisicao_id': f'C{numero:04d}', 'status': status, 'content_type': 'application/pdf',
+                'content_length': numero_ou_none(h.get('content-length')),
+                'content_encoding': h.get('content-encoding', '').strip().lower(),
+                'tem_content_range': False}})
+            self.monitor.registrar('corpo_pdf_salvo', numero=numero, bytes=len(dados))
+        except Exception as erro:
+            self.monitor.registrar('corpo_pdf_falhou', numero=numero, classe=type(erro).__name__)
+        finally:
+            # Sempre libera a resposta, inclusive em falha, para a pagina nao travar.
+            with suppress(Exception):
+                await self.comando('Fetch.continueRequest', {'requestId': request_id}, session)
+
     async def resposta(self, session, params):
         request_id = params['requestId']
         headers = params.get('responseHeaders') or []
-        tipo = next((str(item.get('value', '')).split(';', 1)[0].strip().lower()
-            for item in headers if str(item.get('name', '')).lower() == 'content-type'), '')
+        h = {str(i.get('name', '')).lower(): str(i.get('value', '')) for i in headers}
+        tipo = h.get('content-type', '').split(';', 1)[0].strip().lower()
         status = params.get('responseStatusCode')
-        alterar = (self.ativo and not self.fechando and status == 200
-                   and tipo == 'application/pdf'
-                   and not any(str(item.get('name', '')).lower() == 'content-range'
-                               for item in headers))
+        url = str((params.get('request') or {}).get('url', '')).lower()
+        servlet = 'showjasperreportpdfservlet' in url
+        eh_pdf = tipo in {'application/pdf', 'application/x-pdf'} or (
+            servlet and tipo in {'application/octet-stream', 'application/x-download',
+                                 'binary/octet-stream'})
+        if self.ativo and (servlet or eh_pdf):
+            # Diagnostico sem URL: mostra o que o servidor realmente respondeu.
+            disp = h.get('content-disposition', '').lower()
+            self.monitor.registrar('resposta_relevante', servlet=servlet, status=status,
+                content_type=tipo or 'ausente', tipo_recurso=params.get('resourceType'),
+                disposition='attachment' if 'attachment' in disp else ('inline' if disp else 'ausente'),
+                content_length=numero_ou_none(h.get('content-length')),
+                tem_content_range='content-range' in h)
+        alterar = (self.ativo and not self.fechando and status == 200 and eh_pdf
+                   and 'content-range' not in h)
         if alterar:
             self.candidatos += 1
+            if self.modo == 'corpo' and self.pasta is not None:
+                await self.salvar_corpo(session, request_id, status, h, self.candidatos)
+                return
             nome_local = f'sbk_original_{self.candidatos:04d}.pdf'
             associar = getattr(self.monitor, 'associar_http_download', None)
             if associar is not None:
-                h = {str(item.get('name', '')).lower(): str(item.get('value', '')) for item in headers}
                 associar(nome_local, {'requisicao_id': f'C{self.candidatos:04d}',
                     'status': status, 'content_type': 'application/pdf',
-                    'content_length': numero(h.get('content-length')),
+                    'content_length': numero_ou_none(h.get('content-length')),
                     'content_encoding': h.get('content-encoding', '').strip().lower() if h.get('content-encoding', '').strip().lower() in {'', 'identity', 'gzip', 'br', 'deflate', 'zstd'} else 'outro',
                     'tem_content_range': False, 'disposition': 'attachment',
                     'origem_metadados': 'resposta_original_antes_visualizador'})
@@ -489,8 +531,7 @@ class CapturaOriginal:
                 return
             except Exception as erro:
                 self.monitor.registrar('cabecalho_download_nao_ajustado', classe=type(erro).__name__)
-        # Inclusive respostas ADF/HTML, erros e falhas do comando experimental.
-        # continueRequest na fase Response preserva corpo e cabecalhos recebidos.
+        # Demais respostas (ADF/HTML, scripts, erros): segue sem alteracao.
         with suppress(Exception):
             await self.comando('Fetch.continueRequest', {'requestId': request_id}, session)
 
@@ -593,7 +634,10 @@ def endpoint_na_porta_local(porta, timeout=6):
 
 class CapturaEmSegundoPlano:
     """Loop CDP independente, inclusive durante Tk.mainloop e save_as SYNC."""
-    def __init__(self, monitor, porta_cdp=None):
+    def __init__(self, monitor, porta_cdp=None, modo='corpo', pasta=None, timeout_corpo=1200):
+        self._modo = modo
+        self._pasta = pasta
+        self._timeout_corpo = timeout_corpo
         self._porta_cdp = porta_cdp
         self._contextos_esperados = None
         trava = getattr(monitor, 'trava_threads', None)
@@ -697,7 +741,7 @@ class CapturaEmSegundoPlano:
     async def _executar(self, endpoint):
         self._loop = asyncio.get_running_loop()
         self._sair = asyncio.Event()
-        self._captura = CapturaOriginal(self.monitor)
+        self._captura = CapturaOriginal(self.monitor, self._modo, self._pasta, self._timeout_corpo)
         try:
             await self._captura.instalar(endpoint, self._contextos_esperados)
             self.pronta.set()
@@ -728,6 +772,12 @@ class CapturaEmSegundoPlano:
 
     def armar(self):
         self._chamar(self._armar_async())
+
+    def proximo_corpo(self):
+        try:
+            return self._captura.corpos.popleft()
+        except (IndexError, AttributeError):
+            return None
 
     async def _cancelar_prazo_async(self):
         tarefa = self._watchdog
@@ -834,7 +884,7 @@ class RegistroExecucao:
             h = r.get("http") or {}
             linhas = ["SBK_APP2_CORRIGIDO",
                 "BASE=APP2; CAPTURA=RESPOSTA_ORIGINAL; SEM_REQUISICAO_EXTRA",
-                f"DOWNLOADS_INICIADOS={self.contagens['download_iniciado']}",
+                f"DOWNLOADS_INICIADOS={self.contagens['download_iniciado']}; CORPOS_SALVOS={self.contagens['corpo_pdf_salvo']}; RESPOSTAS_RELEVANTES={self.contagens['resposta_relevante']}",
                 f"RESPOSTAS_AJUSTADAS={self.contagens['cabecalho_download_ajustado']}",
                 f"RESULTADO={r.get('motivo', 'EXECUCAO_NAO_CONCLUIDA')}",
                 f"HTTP={h.get('status', 'NAO_OBSERVADO')}; MIME={h.get('content_type', 'NAO_OBSERVADO')}",
@@ -946,6 +996,83 @@ def baixar_pdf_original(page, context, monitor, captura, botao, timeout=1200):
         monitor.registrar("download_resultado", **r)
         monitor.gravar_resumo()
 
+def baixar_pdf_corpo(page, monitor, captura, botao, timeout=1200):
+    """Um clique; o PDF e gravado a partir da propria resposta (CDP), sem novo GET."""
+    if timeout <= 0:
+        raise ValueError("Prazo de download deve ser positivo.")
+    destino = monitor.pasta / "documento.pdf"
+    r = {"ok": False, "motivo": "NAO_CONCLUIDO", "bytes": None, "paginas": None,
+         "sha256": None, "http": None, "classe_bytes": None, "offset_assinatura": None}
+    try:
+        if destino.exists():
+            raise ErroDownload("DESTINO_JA_EXISTE")
+        captura.armar()
+        botao.scroll_into_view_if_needed()
+        captura.iniciar_prazo(timeout)
+        prazo = time.monotonic() + timeout
+        monitor.registrar("exportacao_automatica_disparada")
+        botao.click(no_wait_after=True)
+        ultimo_erro, limite_extra = None, None
+        while True:
+            agora = time.monotonic()
+            if captura.expirou or agora >= prazo:
+                raise ErroDownload(ultimo_erro or "TIMEOUT_AGUARDANDO_PDF")
+            if ultimo_erro and agora >= limite_extra:
+                raise ErroDownload(ultimo_erro)
+            cand = captura.proximo_corpo()
+            if cand is None:
+                page.wait_for_timeout(200)   # mantem o Playwright processando eventos
+                continue
+            parte = Path(cand["arquivo"])
+            h = cand["http"]
+            try:
+                r["http"] = dict(h)
+                r.update(classificar_arquivo(parte))
+                if h.get("content_length") is not None and h.get("content_encoding", "") in {"", "identity"}:
+                    if r["bytes"] != h["content_length"]:
+                        raise ErroDownload("TAMANHO_HTTP_DIVERGENTE")
+                r.update(validar_pdf(parte, monitor.paginas_esperadas))
+                os.replace(parte, destino)
+                r.update(ok=True, motivo="PDF_ORIGINAL_VALIDADO", arquivo=destino.name)
+                print(f"PDF original salvo e validado: {destino.name} | {r['paginas']} paginas | {r['bytes']} bytes")
+                return destino
+            except (DocumentoInvalido, ErroDownload) as erro:
+                ultimo_erro = str(erro)
+                limite_extra = time.monotonic() + 30   # espera outro candidato
+                monitor.registrar("candidato_pdf_rejeitado", motivo=ultimo_erro)
+    except ErroDownload as erro:
+        r["motivo"] = str(erro)
+        raise
+    except PlaywrightErro as erro:
+        r["motivo"] = "TIMEOUT_DOWNLOAD" if captura.expirou else "FALHA_PLAYWRIGHT"
+        raise ErroDownload(r["motivo"]) from None
+    except OSError as erro:
+        r["motivo"] = f"ERRO_DISCO_{erro.errno}"
+        raise ErroDownload(r["motivo"]) from None
+    except Exception as erro:
+        r["motivo"] = "FALHA_DOWNLOAD_" + type(erro).__name__
+        raise ErroDownload(r["motivo"]) from None
+    finally:
+        with suppress(Exception):
+            captura.cancelar_prazo()
+        # Candidatos nao escolhidos ficam como .extra (nao contam como parciais).
+        for sobra in monitor.pasta.glob("sbk_corpo_*.part"):
+            with suppress(OSError):
+                sobra.rename(sobra.with_suffix(".extra"))
+        with monitor.trava_threads:
+            monitor.resultado = r
+        monitor.registrar("download_resultado", **{k: v for k, v in r.items() if k != "http"})
+        monitor.gravar_resumo()
+
+
+def esperar_rede(alvo, timeout=15000):
+    """networkidle e opcional: no ADF pode nunca ficar ocioso; nao derruba o fluxo."""
+    try:
+        alvo.wait_for_load_state("networkidle", timeout=timeout)
+    except PlaywrightErro:
+        pass
+
+
 def solicitar_token():
   token = {"valor": ""}
 
@@ -987,7 +1114,7 @@ def fechar_browser_seguro(browser):
       browser.close()
 
 
-def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=None):
+def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=None, modo="corpo"):
   if config is None:
     config = configurar(Path(__file__).with_name(".env"))
   URL_SBK = config["URL_SBK"]
@@ -1018,7 +1145,8 @@ def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=Non
     monitor = RegistroExecucao(pasta, paginas_esperadas)
     recursos.callback(monitor.fechar)
     monitor.instalar(context)
-    captura = CapturaEmSegundoPlano(monitor, porta_cdp=porta_cdp)
+    captura = CapturaEmSegundoPlano(monitor, porta_cdp=porta_cdp, modo=modo,
+        pasta=pasta, timeout_corpo=timeout_download)
     recursos.callback(captura.fechar)
 
     page = context.new_page()
@@ -1046,7 +1174,7 @@ def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=Non
       page.get_by_text("Autenticar").click()
 
     print("Botão autenticar acionado.")
-    page.wait_for_load_state("networkidle")
+    esperar_rede(page, 30000)
     print("Autenticação concluída.")
 
     # ==========================================
@@ -1121,7 +1249,7 @@ def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=Non
     dialog_frame.wait_for_selector(seletor_btn1, timeout=15000)
     dialog_frame.click(seletor_btn1)
 
-    dialog_frame.wait_for_load_state("networkidle")
+    esperar_rede(dialog_frame)
 
     # 3. Marcar a outra checkbox SelectAllDocDet
     print("Marcando a segunda checkbox (Selecionar Detalhes)...")
@@ -1133,7 +1261,7 @@ def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=Non
     dialog_frame.locator(seletor_chk2).set_checked(True)
 
     print("Aguardando o sistema processar a seleção das imagens...")
-    dialog_frame.wait_for_load_state("networkidle")
+    esperar_rede(dialog_frame)
     dialog_frame.wait_for_timeout(3000)
 
     # ==========================================
@@ -1147,10 +1275,15 @@ def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=Non
     nome_arquivo = monitor.pasta / "documento.pdf"
     erro_download = None
     try:
-      baixar_pdf_original(
-          page, context, monitor, captura, dialog_frame.locator(seletor_btn2),
-          timeout=timeout_download,
-      )
+      if modo == "corpo":
+        baixar_pdf_corpo(page, monitor, captura, dialog_frame.locator(seletor_btn2),
+                         timeout=timeout_download)
+      else:
+        monitor.armado = True
+        baixar_pdf_original(
+            page, context, monitor, captura, dialog_frame.locator(seletor_btn2),
+            timeout=timeout_download,
+        )
       print(f"Arquivo validado: {nome_arquivo.name}")
     except ErroDownload as erro:
       erro_download = erro
@@ -1174,6 +1307,8 @@ def main():
   parser.add_argument("--env", type=Path, default=Path(__file__).with_name(".env"))
   parser.add_argument("--timeout-download", type=int, default=1200)
   parser.add_argument("--paginas-esperadas", type=int)
+  parser.add_argument("--modo", choices=["corpo", "download"], default="corpo",
+                      help="corpo: grava a resposta PDF via CDP (padrao). download: forca attachment.")
   args = parser.parse_args()
   if not 10 <= args.timeout_download <= 7200:
     parser.error("--timeout-download deve estar entre 10 e 7200 segundos.")
@@ -1181,7 +1316,7 @@ def main():
     parser.error("--paginas-esperadas deve ser positivo.")
   try:
     config = configurar(args.env)
-    executar_automacao(config, args.timeout_download, args.paginas_esperadas)
+    executar_automacao(config, args.timeout_download, args.paginas_esperadas, args.modo)
     return 0
   except ConfiguracaoErro as erro:
     print(f"Configuracao: {erro}", file=sys.stderr)
