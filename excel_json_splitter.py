@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import argparse
@@ -779,131 +778,6 @@ class ErroDownload(RuntimeError):
     """Erro controlado, sem dados do documento ou credenciais."""
 
 
-class FluxoAutomacaoErro(RuntimeError):
-    """Codigo fixo do fluxo, sem mensagem bruta do navegador."""
-
-
-SELETOR_TOKEN = '[id="duplaAutenticacao:::content"]'
-SELETOR_CONSULTA = '[id="pt1:pt_1ConsultaDeImagem::text"]'
-
-
-def _esperar_alvos(context, alvos, monitor, etapa, timeout=60, escopo_preferido=None):
-    """Buscar elementos visiveis nas paginas/frames atuais, com prazo unico.
-
-    Nao inspeciona valores, HTML nem URLs. Recolhe a lista a cada tentativa:
-    SSO, ADF e fechamento da janela inicial podem trocar o escopo valido.
-    """
-    monitor.marcar_etapa(etapa)
-    prazo = time.monotonic() + timeout
-    while time.monotonic() < prazo:
-        paginas = [p for p in context.pages if not p.is_closed()]
-        if not paginas:
-            monitor.resultado = {'ok': False, 'motivo': 'TODAS_JANELAS_FECHADAS'}
-            raise FluxoAutomacaoErro('TODAS_JANELAS_FECHADAS')
-        escopos = [(p, f) for p in paginas for f in p.frames]
-        for nome, seletor in alvos:
-            encontrados = []
-            for pagina, frame in escopos:
-                try:
-                    if frame.is_detached():
-                        continue
-                    locator = frame.locator(seletor)
-                    for indice in range(locator.count()):
-                        candidato = locator.nth(indice)
-                        if candidato.is_visible():
-                            encontrados.append((pagina, frame, candidato))
-                except PlaywrightErro:
-                    # Navegacao/fechamento durante a busca: renovar no proximo pump.
-                    continue
-            preferidos = [item for item in encontrados if item[1] == escopo_preferido]
-            if preferidos:
-                encontrados = preferidos
-            if len(encontrados) > 1:
-                codigo = 'ELEMENTO_AMBIGUO_' + nome
-                monitor.resultado = {'ok': False, 'motivo': codigo}
-                raise FluxoAutomacaoErro(codigo)
-            if encontrados:
-                pagina, frame, locator = encontrados[0]
-                monitor.registrar('elemento_localizado', alvo=nome,
-                    pagina=paginas.index(pagina) + 1, em_frame=frame != pagina.main_frame)
-                return nome, pagina, frame, locator
-        for pagina in reversed(paginas):
-            try:
-                # Pump SYNC: recebe eventos de paginas/frames novos enquanto espera.
-                pagina.wait_for_timeout(min(150, max(1, (prazo - time.monotonic()) * 1000)))
-                break
-            except PlaywrightErro:
-                continue
-    codigo = 'TIMEOUT_' + etapa
-    monitor.resultado = {'ok': False, 'motivo': codigo}
-    monitor.registrar('fluxo_timeout', etapa=etapa,
-        paginas=len(context.pages), frames=sum(len(p.frames) for p in context.pages if not p.is_closed()))
-    raise FluxoAutomacaoErro(codigo)
-
-
-def aguardar_elemento(context, seletor, monitor, etapa, timeout=60, escopo_preferido=None):
-    _, pagina, frame, locator = _esperar_alvos(context, [(etapa, seletor)],
-        monitor, etapa, timeout, escopo_preferido)
-    return pagina, frame, locator
-
-
-def pausar_contexto(context, milissegundos):
-    """Manter as pausas originais sem depender de um Frame que pode sumir."""
-    prazo = time.monotonic() + milissegundos / 1000
-    while time.monotonic() < prazo:
-        paginas = [p for p in context.pages if not p.is_closed()]
-        if not paginas:
-            raise FluxoAutomacaoErro('TODAS_JANELAS_FECHADAS')
-        try:
-            paginas[-1].wait_for_timeout(max(1, (prazo - time.monotonic()) * 1000))
-            return
-        except PlaywrightErro:
-            continue
-
-
-def autenticar_sbk(context, monitor, timeout_login=600):
-    print('Realize o login inicial normalmente. Aguardando token em todas as janelas e frames...')
-    nome, pagina, frame, campo = _esperar_alvos(context,
-        [('MENU_CONSULTA', SELETOR_CONSULTA), ('TOKEN', SELETOR_TOKEN)],
-        monitor, 'AGUARDANDO_TOKEN_OU_MENU', timeout_login)
-    if nome == 'MENU_CONSULTA':
-        monitor.marcar_etapa('LOGIN_JA_CONCLUIDO')
-        print('Login ja concluido. Continuando os cliques automaticos...')
-        return pagina
-    monitor.marcar_etapa('TOKEN_LOCALIZADO')
-    with suppress(PlaywrightErro):
-        pagina.bring_to_front()
-    print('Campo de token localizado. Abrindo a janela Tkinter...')
-    monitor.marcar_etapa('SOLICITANDO_TOKEN_TKINTER')
-    # Exatamente a funcao original, chamada na thread principal.
-    try:
-        token = solicitar_token()
-    except tk.TclError:
-        monitor.resultado = {'ok': False, 'motivo': 'TKINTER_INDISPONIVEL'}
-        raise FluxoAutomacaoErro('TKINTER_INDISPONIVEL') from None
-    if not token or not token.strip():
-        monitor.resultado = {'ok': False, 'motivo': 'TOKEN_CANCELADO_OU_VAZIO'}
-        raise FluxoAutomacaoErro('TOKEN_CANCELADO_OU_VAZIO')
-    # O frame pode ter sido recriado durante o preenchimento da janela Tkinter.
-    nome, pagina, frame, campo = _esperar_alvos(context,
-        [('MENU_CONSULTA', SELETOR_CONSULTA), ('TOKEN', SELETOR_TOKEN)],
-        monitor, 'REENCONTRANDO_CAMPO_TOKEN', 30, frame)
-    if nome != 'MENU_CONSULTA':
-        campo.fill(token.strip(), timeout=15000)
-        monitor.marcar_etapa('TOKEN_PREENCHIDO')
-        _, pagina, frame, botao = _esperar_alvos(context,
-            [('BOTAO_AUTENTICAR', '#b4 a'), ('TEXTO_AUTENTICAR', 'text="Autenticar"')],
-            monitor, 'AGUARDANDO_BOTAO_AUTENTICAR', 30, frame)
-        botao.click(no_wait_after=True, timeout=15000)
-        monitor.marcar_etapa('AUTENTICACAO_ENVIADA')
-    token = None
-    pagina, _, _ = aguardar_elemento(context, SELETOR_CONSULTA, monitor,
-        'AGUARDANDO_MENU_CONSULTA', timeout=120)
-    monitor.marcar_etapa('AUTENTICACAO_CONCLUIDA')
-    print('Autenticacao concluida. Iniciando os cliques automaticos...')
-    return pagina
-
-
 class RegistroExecucao:
     def __init__(self, pasta, paginas_esperadas=None):
         self.pasta = Path(pasta)
@@ -920,11 +794,6 @@ class RegistroExecucao:
         self.inicio = time.monotonic()
         self.contagens = Counter()
         self.paginas = set()
-        self.etapa_atual = 'INICIALIZACAO'
-
-    def marcar_etapa(self, etapa):
-        self.etapa_atual = etapa
-        self.registrar('fluxo_etapa', etapa=etapa)
 
     def registrar(self, evento, **dados):
         with self.trava_threads:
@@ -964,9 +833,7 @@ class RegistroExecucao:
             r = self.resultado
             h = r.get("http") or {}
             linhas = ["SBK_APP2_CORRIGIDO",
-                "BASE=APP2; LOGIN_MULTI_JANELAS; TKINTER_ORIGINAL",
-                "REVISAO=2026-10-20_LOGIN_V2",
-                f"ULTIMA_ETAPA={self.etapa_atual}",
+                "BASE=APP2; CAPTURA=RESPOSTA_ORIGINAL; SEM_REQUISICAO_EXTRA",
                 f"DOWNLOADS_INICIADOS={self.contagens['download_iniciado']}",
                 f"RESPOSTAS_AJUSTADAS={self.contagens['cabecalho_download_ajustado']}",
                 f"RESULTADO={r.get('motivo', 'EXECUCAO_NAO_CONCLUIDA')}",
@@ -974,6 +841,7 @@ class RegistroExecucao:
                 f"CLASSE_BYTES={r.get('classe_bytes', 'NAO_MEDIDA')}; OFFSET_PDF={r.get('offset_assinatura')}",
                 f"PDF_VALIDADO_ESTRUTURA={'SIM' if r.get('ok') else 'NAO'}",
                 f"BYTES={r.get('bytes')}; PAGINAS={r.get('paginas')}; ESPERADAS={self.paginas_esperadas}",
+                f"SHA256={r.get('sha256')}",
                 f"ARQUIVO={r.get('arquivo', 'NAO_SALVO')}",
                 f"PARCIAIS_RESTANTES={len(list(self.pasta.glob('*.part')))}"]
             (self.pasta / "resumo.txt").write_text("\n".join(linhas) + "\n", encoding="utf-8")
@@ -981,8 +849,6 @@ class RegistroExecucao:
     def fechar(self):
         with self.trava_threads:
             if not self.fechado:
-                if not self.resultado:
-                    self.resultado = {'ok': False, 'motivo': 'FLUXO_INTERROMPIDO_' + self.etapa_atual}
                 self.gravar_resumo()
                 self.fechado = True
                 self.arquivo.close()
@@ -1121,7 +987,7 @@ def fechar_browser_seguro(browser):
       browser.close()
 
 
-def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=None, timeout_login=600):
+def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=None):
   if config is None:
     config = configurar(Path(__file__).with_name(".env"))
   URL_SBK = config["URL_SBK"]
@@ -1156,23 +1022,52 @@ def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=Non
     recursos.callback(captura.fechar)
 
     page = context.new_page()
-    print("Versao: APP2_LOGIN_V2_2026-10-20 | captura local direta.")
+    print("Captura local: revisao 2026-10-20 (conexao direta).")
     captura.iniciar(browser)
 
     print("Abrindo SBK...")
-    monitor.marcar_etapa('ABRINDO_SBK')
-    page.goto(URL_SBK, wait_until='domcontentloaded')
-    page = autenticar_sbk(context, monitor, timeout_login=timeout_login)
+    page.goto(URL_SBK)
+
+    print("Realize o login normalmente.")
+    print("Aguardando tela de token...")
+    page.wait_for_selector("#duplaAutenticacao\\:\\:\\:content", timeout=120000)
+
+    print("Campo de token localizado.")
+    token = solicitar_token()
+    if not token:
+      raise ConfiguracaoErro("Token nao informado; autenticacao cancelada.")
+
+    page.fill("#duplaAutenticacao\\:\\:\\:content", token)
+    print("Token preenchido.")
+
+    try:
+      page.locator("#b4 a").click()
+    except:
+      page.get_by_text("Autenticar").click()
+
+    print("Botão autenticar acionado.")
+    page.wait_for_load_state("networkidle")
+    print("Autenticação concluída.")
 
     # ==========================================
     # CONSULTA IMAGEM
     # ==========================================
     print("Abrindo Consulta Imagem...")
-    page, menu_frame, menu = aguardar_elemento(context, SELETOR_CONSULTA,
-        monitor, 'ABRINDO_CONSULTA_IMAGEM')
-    menu.click(no_wait_after=True, timeout=15000)
-    page, dialog_frame, tipo_documento = aguardar_elemento(context,
-        "#pt1\\:socTipoDocumento\\:\\:\\:content", monitor, 'AGUARDANDO_TIPO_DOCUMENTO', timeout=120)
+    page.click("#pt1\\:pt_1ConsultaDeImagem\\:\\:text")
+    page.wait_for_timeout(5000)
+
+    page.wait_for_timeout(5000)
+
+    dialog_frame = None
+    for frame in page.frames:
+      if "adf.dialog-request" in frame.url:
+        dialog_frame = frame
+        break
+
+    if dialog_frame is None:
+      raise Exception(
+          "Não foi possível localizar o frame da Consulta Imagem."
+      )
 
     print("Frame localizado com sucesso.")
 
@@ -1180,36 +1075,32 @@ def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=Non
     # TIPO DOCUMENTO
     # ==========================================
     print("Selecionando CONTABIL BRADESCO-189...")
-    monitor.marcar_etapa('SELECIONANDO_TIPO_DOCUMENTO')
-    tipo_documento.select_option(label="CONTABIL BRADESCO-189")
-    pausar_contexto(context, 2000)
+    dialog_frame.select_option(
+        "#pt1\\:socTipoDocumento\\:\\:\\:content",
+        label="CONTABIL BRADESCO-189",
+    )
+    dialog_frame.wait_for_timeout(2000)
 
     # ==========================================
     # CLIENTE
     # ==========================================
     print("Selecionando Cliente...")
-    page, dialog_frame, cliente = aguardar_elemento(context,
-        "#pt1\\:\\:sorTipoPesquisa\\:\\:_1", monitor, 'SELECIONANDO_CLIENTE', escopo_preferido=dialog_frame)
-    cliente.click()
-    pausar_contexto(context, 1000)
+    dialog_frame.click("#pt1\\:\\:sorTipoPesquisa\\:\\:_1")
+    dialog_frame.wait_for_timeout(1000)
 
     # ==========================================
     # ID
     # ==========================================
     print("Preenchendo o ID configurado no .env...")
-    page, dialog_frame, campo_id = aguardar_elemento(context,
-        "#pt1\\:\\:itTipoPesquisaItem\\:\\:\\:content", monitor, 'PREENCHENDO_ID', escopo_preferido=dialog_frame)
-    campo_id.fill(ID_TESTE)
-    pausar_contexto(context, 1000)
+    dialog_frame.fill("#pt1\\:\\:itTipoPesquisaItem\\:\\:\\:content", ID_TESTE)
+    dialog_frame.wait_for_timeout(1000)
 
     # ==========================================
     # PESQUISAR
     # ==========================================
     print("Clicando em Pesquisar Documento...")
-    page, dialog_frame, pesquisar = aguardar_elemento(context,
-        "#pt1\\:\\:btPesquisarDocumento", monitor, 'PESQUISANDO_DOCUMENTO', escopo_preferido=dialog_frame)
-    pesquisar.click()
-    pausar_contexto(context, 5000)
+    dialog_frame.click("#pt1\\:\\:btPesquisarDocumento")
+    dialog_frame.wait_for_timeout(5000)
     print("Pesquisa enviada.")
 
     # ==========================================
@@ -1219,46 +1110,45 @@ def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=Non
     # 1. Marcar o checkbox SelectAllDoc
     print("Marcando a primeira checkbox (Selecionar Todos)...")
     seletor_chk1 = "#pt1\\:\\:pc1\\:\\:t1\\:\\:sbcSelectAllDoc\\:\\:\\:content"
-    page, dialog_frame, checkbox1 = aguardar_elemento(context, seletor_chk1,
-        monitor, 'SELECIONANDO_DOCUMENTOS', timeout=120, escopo_preferido=dialog_frame)
-    pausar_contexto(context, 2000)
-    checkbox1.click()
+    dialog_frame.wait_for_selector(seletor_chk1, timeout=15000)
+    dialog_frame.wait_for_timeout(2000)
+    dialog_frame.locator(seletor_chk1).set_checked(True)
 
     # 2. Clique em Confirmar Filtro
     print("Clicando em Confirmar Filtro...")
-    pausar_contexto(context, 2000)
+    dialog_frame.wait_for_timeout(2000)
     seletor_btn1 = "#pt1\\:\\:pc1\\:\\:btConfirmarFiltro > a"
-    page, dialog_frame, confirmar = aguardar_elemento(context, seletor_btn1,
-        monitor, 'CONFIRMANDO_FILTRO', escopo_preferido=dialog_frame)
-    confirmar.click(no_wait_after=True)
+    dialog_frame.wait_for_selector(seletor_btn1, timeout=15000)
+    dialog_frame.click(seletor_btn1)
+
+    dialog_frame.wait_for_load_state("networkidle")
 
     # 3. Marcar a outra checkbox SelectAllDocDet
     print("Marcando a segunda checkbox (Selecionar Detalhes)...")
     seletor_chk2 = (
         "#pt1\\:\\:pcIPD\\:\\:t3\\:\\:sbcSelectAllDocDet\\:\\:\\:content"
     )
-    page, dialog_frame, checkbox2 = aguardar_elemento(context, seletor_chk2,
-        monitor, 'SELECIONANDO_DETALHES', timeout=120, escopo_preferido=dialog_frame)
-    pausar_contexto(context, 2000)
-    checkbox2.click()
+    dialog_frame.wait_for_selector(seletor_chk2, timeout=15000)
+    dialog_frame.wait_for_timeout(2000)
+    dialog_frame.locator(seletor_chk2).set_checked(True)
 
     print("Aguardando o sistema processar a seleção das imagens...")
-    pausar_contexto(context, 3000)
+    dialog_frame.wait_for_load_state("networkidle")
+    dialog_frame.wait_for_timeout(3000)
 
     # ==========================================
     # 4. DOWNLOAD ORIGINAL: apresentar como attachment antes do visualizador
     # ==========================================
     print("Aguardando botão Exportar Imagens estar totalmente pronto...")
     seletor_btn2 = "#pt1\\:\\:pcIPD\\:\\:btDownloadImgSelect > a"
-    page, dialog_frame, exportar = aguardar_elemento(context, seletor_btn2,
-        monitor, 'AGUARDANDO_EXPORTAR_IMAGENS', timeout=120, escopo_preferido=dialog_frame)
-    pausar_contexto(context, 3000)
+    dialog_frame.wait_for_selector(seletor_btn2, timeout=15000)
+    dialog_frame.wait_for_timeout(3000)
 
     nome_arquivo = monitor.pasta / "documento.pdf"
     erro_download = None
     try:
       baixar_pdf_original(
-          page, context, monitor, captura, exportar,
+          page, context, monitor, captura, dialog_frame.locator(seletor_btn2),
           timeout=timeout_download,
       )
       print(f"Arquivo validado: {nome_arquivo.name}")
@@ -1274,7 +1164,7 @@ def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=Non
       input("\nPressione ENTER aqui para encerrar o Edge de testes...")
     except EOFError:
       pass
-    browser.close()
+    fechar_browser_seguro(browser)
     if erro_download is not None:
       raise erro_download
 
@@ -1283,19 +1173,15 @@ def main():
   parser = argparse.ArgumentParser(description="App2 original com .env e download nativo validado.")
   parser.add_argument("--env", type=Path, default=Path(__file__).with_name(".env"))
   parser.add_argument("--timeout-download", type=int, default=1200)
-  parser.add_argument("--timeout-login", type=int, default=600,
-                      help="Segundos para localizar o token ou o menu apos o login inicial (padrao: 600).")
   parser.add_argument("--paginas-esperadas", type=int)
   args = parser.parse_args()
   if not 10 <= args.timeout_download <= 7200:
     parser.error("--timeout-download deve estar entre 10 e 7200 segundos.")
-  if not 30 <= args.timeout_login <= 3600:
-    parser.error("--timeout-login deve estar entre 30 e 3600 segundos.")
   if args.paginas_esperadas is not None and args.paginas_esperadas <= 0:
     parser.error("--paginas-esperadas deve ser positivo.")
   try:
     config = configurar(args.env)
-    executar_automacao(config, args.timeout_download, args.paginas_esperadas, args.timeout_login)
+    executar_automacao(config, args.timeout_download, args.paginas_esperadas)
     return 0
   except ConfiguracaoErro as erro:
     print(f"Configuracao: {erro}", file=sys.stderr)
@@ -1305,9 +1191,6 @@ def main():
     return 1
   except CapturaInicializacaoErro as erro:
     print(f"Captura: {erro}", file=sys.stderr)
-    return 1
-  except FluxoAutomacaoErro as erro:
-    print(f"Fluxo: {erro}. Confira ULTIMA_ETAPA no resumo local.", file=sys.stderr)
     return 1
   except KeyboardInterrupt:
     print("Execucao interrompida pelo usuario.", file=sys.stderr)
