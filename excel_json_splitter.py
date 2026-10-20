@@ -1,3 +1,8 @@
+"""Automação baseada no app2.py: .env e download da resposta PDF original.
+
+O CDP muda apenas Content-Disposition antes de o visualizador consumir o PDF.
+Não repete a URL temporária do ADF e não imprime a página em PDF.
+"""
 from __future__ import annotations
 
 import argparse
@@ -14,8 +19,6 @@ import socket
 import sys
 import threading
 import time
-import tkinter as tk
-from tkinter import ttk
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, HTTPRedirectHandler, build_opener
 
@@ -592,7 +595,7 @@ def endpoint_na_porta_local(porta, timeout=6):
 
 
 class CapturaEmSegundoPlano:
-    """Loop CDP independente, inclusive durante Tk.mainloop e save_as SYNC."""
+    """Loop CDP independente, inclusive durante input() e save_as SYNC."""
     def __init__(self, monitor, porta_cdp=None):
         self._porta_cdp = porta_cdp
         self._contextos_esperados = None
@@ -946,41 +949,6 @@ def baixar_pdf_original(page, context, monitor, captura, botao, timeout=1200):
         monitor.registrar("download_resultado", **r)
         monitor.gravar_resumo()
 
-def solicitar_token():
-  token = {"valor": ""}
-
-  def confirmar():
-    token["valor"] = entrada.get().strip()
-    janela.destroy()
-
-  janela = tk.Tk()
-  janela.title("SBK - Dupla Autenticação")
-  janela.geometry("500x220")
-  janela.resizable(False, False)
-
-  titulo = tk.Label(
-      janela, text="Dupla Autenticação", font=("Segoe UI", 12, "bold")
-  )
-  titulo.pack(pady=(20, 10))
-
-  texto = tk.Label(
-      janela,
-      text="Digite o token recebido por e-mail para continuar.",
-      wraplength=450,
-  )
-  texto.pack()
-
-  entrada = ttk.Entry(janela, width=35, justify="center")
-  entrada.pack(pady=15)
-  entrada.focus()
-
-  ttk.Button(janela, text="Confirmar", command=confirmar).pack()
-  janela.bind("<Return>", lambda e: confirmar())
-  janela.mainloop()
-
-  return token["valor"]
-
-
 def fechar_browser_seguro(browser):
   with suppress(Exception):
     if browser.is_connected():
@@ -1028,31 +996,20 @@ def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=Non
     print("Abrindo SBK...")
     page.goto(URL_SBK)
 
-    print("Realize o login normalmente.")
-    print("Aguardando tela de token...")
-    page.wait_for_selector("#duplaAutenticacao\\:\\:\\:content", timeout=120000)
-
-    print("Campo de token localizado.")
-    token = solicitar_token()
-    if not token:
-      raise ConfiguracaoErro("Token nao informado; autenticacao cancelada.")
-
-    page.fill("#duplaAutenticacao\\:\\:\\:content", token)
-    print("Token preenchido.")
-
+    print("Faca o login completo no navegador, incluindo o token recebido por e-mail.")
+    print("Aguarde o sistema abrir a tela principal apos autenticar.")
     try:
-      page.locator("#b4 a").click()
-    except:
-      page.get_by_text("Autenticar").click()
-
-    print("Botão autenticar acionado.")
-    page.wait_for_load_state("networkidle")
-    print("Autenticação concluída.")
+      input("\nQuando terminar o login, volte a este terminal e pressione ENTER para iniciar a consulta...")
+    except EOFError:
+      raise ConfiguracaoErro(
+          "Execute o script em um terminal interativo para confirmar o login com ENTER."
+      ) from None
 
     # ==========================================
     # CONSULTA IMAGEM
     # ==========================================
     print("Abrindo Consulta Imagem...")
+    page.locator("#pt1\\:pt_1ConsultaDeImagem\\:\\:text").wait_for(state="visible", timeout=120000)
     page.click("#pt1\\:pt_1ConsultaDeImagem\\:\\:text")
     page.wait_for_timeout(5000)
 
