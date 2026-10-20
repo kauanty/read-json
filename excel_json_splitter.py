@@ -1,21 +1,26 @@
+
 from __future__ import annotations
 
 import argparse
 import asyncio
-from collections import Counter
-from contextlib import suppress
+from collections import Counter, deque
+import concurrent.futures
+from contextlib import ExitStack, suppress
 from datetime import datetime
-from importlib.metadata import version
 import json
 import os
 from pathlib import Path
 import re
 import sys
+import threading
 import time
-from urllib.parse import urljoin, urlsplit
+import tkinter as tk
+from tkinter import ttk
+from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
-from playwright.async_api import Error as PlaywrightErro, async_playwright
+from playwright.sync_api import Error as PlaywrightErro, sync_playwright
+from websockets.asyncio.client import connect
 
 class ConfiguracaoErro(ValueError):
     pass
@@ -52,64 +57,9 @@ def configurar(env_path: Path) -> dict[str, str]:
     return {"URL_SBK": url, "ID_TESTE": identificador}
 
 
-class Sanitizador:
-    """Permite apenas termos estaticos conhecidos; todo o resto recebe alias."""
-
-    CAMINHOS = {"jdoc", "faces", "showjasperreportpdfservlet", "adf", "login"}
-    PARAMETROS = {"_rtrId", "_afrPage", "_afrLoop", "_afrWindowId", "_afrWindowMode"}
-
-    def __init__(self):
-        self.origens = {}
-        self.recursos = {}
-
-    def url(self, value: str | None) -> dict:
-        value = value or ""
-        recurso = self.recursos.setdefault(value, f"R{len(self.recursos) + 1:04d}")
-        try:
-            partes = urlsplit(value)
-            esquema = partes.scheme.lower()
-            if esquema not in {"http", "https", "blob", "data", "about", "chrome-extension", "edge"}:
-                esquema = "outro"
-            origem = None
-            caminho = "[oculto]"
-            parametros = []
-            if esquema in {"http", "https"}:
-                chave = (partes.scheme.lower(), partes.hostname, partes.port)
-                origem = self.origens.setdefault(chave, f"O{len(self.origens) + 1:03d}")
-                segmentos = [s.lower() if s.lower() in self.CAMINHOS else "*"
-                             for s in partes.path.split("/") if s]
-                caminho = "/" + "/".join(segmentos[:12])
-                if len(segmentos) > 12:
-                    caminho += "/..."
-                parametros = sorted({p.split("=", 1)[0] for p in partes.query.split("&")}
-                                    & self.PARAMETROS)
-            endereco = f"{esquema}://{origem or '[oculto]'}{caminho}"
-            return {"url": endereco, "esquema": esquema, "origem_id": origem,
-                    "recurso_id": recurso, "parametros_adf": parametros,
-                    "tem_query": bool(partes.query), "tem_fragmento": bool(partes.fragment)}
-        except (ValueError, TypeError):
-            return {"url": "[url_oculta]", "esquema": "outro", "origem_id": None,
-                    "recurso_id": recurso, "parametros_adf": [],
-                    "tem_query": False, "tem_fragmento": False}
-
-
 def numero(value):
     value = str(value or "")
     return int(value) if re.fullmatch(r"[0-9]{1,18}", value) else None
-
-
-def intervalo(value):
-    value = str(value or "").strip().lower()
-    return value if re.fullmatch(r"bytes(?:=\d*-\d*(?:,\s*\d*-\d*)*| (?:\d+-\d+|\*)/(?:\d+|\*))", value) else None
-
-
-def mime(value):
-    value = str(value or "").split(";", 1)[0].strip().lower()
-    permitidos = {"application/pdf", "application/octet-stream", "text/html",
-                  "application/json", "text/json", "text/plain", "application/xml",
-                  "text/xml", "text/javascript", "application/javascript"}
-    return value if value in permitidos else ("outro" if value else "ausente")
-
 
 
 """Validação estrutural conservadora de um PDF já salvo em disco.
@@ -334,422 +284,847 @@ def validar_pdf(path: Path, paginas_esperadas: int | None = None) -> dict:
     except Exception:
         raise DocumentoInvalido("PDF inválido ou estrutura inconsistente.") from None
 
+def classificar_arquivo(path):
+    tamanho = Path(path).stat().st_size
+    with Path(path).open("rb") as handle:
+        inicio = handle.read(1024)
+    limpo = inicio.lstrip(b"\xef\xbb\xbf \t\r\n\x00")
+    if not inicio:
+        classe = "VAZIO"
+    elif inicio.startswith(b"%PDF-"):
+        classe = "PDF"
+    elif b"%PDF-" in inicio:
+        classe = "PDF_COM_PREFIXO"
+    elif limpo.lower().startswith((b"<!doctype", b"<html", b"<head", b"<script", b"<?xml")):
+        classe = "HTML_OU_XML"
+    elif limpo.startswith((b"{", b"[")):
+        classe = "JSON_POSSIVEL"
+    elif limpo.startswith(b"JVBERi0"):
+        classe = "BASE64_PDF_POSSIVEL"
+    elif inicio.startswith(b"\x1f\x8b"):
+        classe = "GZIP"
+    elif inicio.startswith(b"PK\x03\x04"):
+        classe = "ZIP"
+    else:
+        classe = "OUTRO"
+    return {"bytes": tamanho, "classe_bytes": classe,
+            "offset_assinatura": inicio.find(b"%PDF-")}
 
-class Monitor:
-    """Observacao manual; downloads nativos sao preservados antes de fechar."""
 
-    def __init__(self, pasta, timeout_download=1200, paginas_esperadas=None):
-        self.pasta = Path(pasta)
-        self.pasta.mkdir(parents=True, exist_ok=True)
-        self.log = (self.pasta / "eventos.jsonl").open("x", encoding="utf-8", buffering=1)
-        self.sanitizador = Sanitizador()
-        self.inicio = time.monotonic()
-        self.timeout_download = timeout_download
-        self.paginas_esperadas = paginas_esperadas
-        self.paginas = {}
-        self.requisicoes = {}
-        self.respostas = {}
-        self.respostas_por_id = {}
-        self.ultimas_requisicoes = {}
+class ProtocoloErro(RuntimeError):
+    pass
+
+
+class CapturaOriginal:
+    """Preserva corpo HTTP e converte apenas a apresentacao PDF em download.
+
+    O Fetch pausa nos cabecalhos da resposta recebida; continueResponse troca
+    somente Content-Disposition. Nao ha GET adicional, leitura do corpo pelo
+    Python, impressao nem reconstrucao do PDF. A transferencia e nativa.
+    """
+    def __init__(self, monitor):
+        self.monitor = monitor
+        self.ws = None
+        self.leitor = None
+        self.sequencia = 0
+        self.futuros = {}
+        self.sessoes_futuras = {}
+        self.sessoes = set()
+        self.alvos = set()
+        self.alvos_por_sessao = {}
         self.tarefas = set()
-        self.copias = set()
-        self.transferencias = set()
-        self.validacoes = set()
-        self.trava_validacao = asyncio.Lock()
-        self.partes = set()
-        self.resultados = []
-        self.contagens = Counter()
-        self.aceitar_downloads = True
-        self.rede_ativa = True
-        self.fechado = False
-        self.linhas = 0
-        self.ultimo_download = None
-        self.motivo = "em_execucao"
+        self.ativo = False
+        self.fechando = False
+        self.ajustados = 0
+        self.candidatos = 0
 
-    def registrar(self, evento, **dados):
-        if self.fechado:
-            return
-        self.contagens[evento] += 1
-        if self.linhas >= 30000 and evento not in {"fim", "falha", "download_resultado"}:
-            if self.linhas == 30000:
-                self.log.write('{"evento":"limite_eventos","limite":30000}\n')
-                self.linhas += 1
-            return
-        self.log.write(json.dumps({"segundos": round(time.monotonic() - self.inicio, 3),
-                                   "evento": evento, **dados}, ensure_ascii=True) + "\n")
-        self.linhas += 1
-
-    def tarefa(self, coroutine, grupo=None):
+    def tarefa(self, coroutine):
         task = asyncio.create_task(coroutine)
         self.tarefas.add(task)
-        if grupo is not None:
-            grupo.add(task)
-
-        def terminou(completed):
-            self.tarefas.discard(completed)
-            if grupo is not None:
-                grupo.discard(completed)
-            if not completed.cancelled():
-                erro = completed.exception()
+        def terminou(done):
+            self.tarefas.discard(done)
+            if not done.cancelled():
+                erro = done.exception()
                 if erro:
-                    self.registrar("observador_falhou", classe=type(erro).__name__)
-
+                    self.monitor.registrar('captura_observador_falhou', classe=type(erro).__name__)
         task.add_done_callback(terminou)
         return task
 
-    def pagina_id(self, page):
-        return self.paginas.setdefault(page, f"P{len(self.paginas) + 1:03d}")
-
-    def observar_pagina(self, page):
-        if page in self.paginas:
-            return
-        pid = self.pagina_id(page)
-        # Instalar listener antes de qualquer await, inclusive em pop-ups.
-        page.on("download", self.receber_download)
-        page.on("framenavigated", lambda frame: self.registrar(
-            "frame_navegou", pagina_id=pid, principal=frame == page.main_frame,
-            endereco=self.sanitizador.url(frame.url)))
-        page.on("crash", lambda: self.registrar("pagina_crash", pagina_id=pid))
-        page.on("close", lambda: self.registrar("pagina_fechada", pagina_id=pid))
-        self.registrar("pagina", pagina_id=pid, endereco=self.sanitizador.url(page.url))
-
-    def instalar(self, context):
-        self.context = context
-        context.on("page", self.observar_pagina)
-        for page in context.pages:
-            self.observar_pagina(page)
-        context.on("request", self.requisicao)
-        context.on("response", self.resposta)
-        context.on("requestfinished", lambda request: self.tarefa(self.concluida(request)) if self.rede_ativa else None)
-        context.on("requestfailed", self.falhou)
-        self.registrar("captura_iniciada", modo="manual", antes_de_abrir_site=True)
-
-    def requisicao(self, request):
-        if not self.rede_ativa or request in self.requisicoes:
-            return
-        if len(self.requisicoes) >= 10000:
-            if not self.contagens["limite_requisicoes"]:
-                self.registrar("limite_requisicoes", limite=10000)
-            return
-        rid = f"Q{len(self.requisicoes) + 1:05d}"
-        self.requisicoes[request] = rid
-        self.ultimas_requisicoes[request.url] = rid
-        # Registrar antes do await de headers para manter a correlacao cronologica.
-        self.registrar("requisicao", requisicao_id=rid, metodo=request.method,
-                       tipo=request.resource_type, endereco=self.sanitizador.url(request.url),
-                       redirecionada_de=self.requisicoes.get(request.redirected_from))
-        self.tarefa(self.cabecalhos(request, rid))
-
-    async def cabecalhos(self, request, rid):
+    async def comando(self, metodo, params=None, session=None, timeout=15):
+        self.sequencia += 1
+        identificador = self.sequencia
+        future = asyncio.get_running_loop().create_future()
+        self.futuros[identificador] = future
+        self.sessoes_futuras[identificador] = session
+        message = {'id': identificador, 'method': metodo, 'params': params or {}}
+        if session:
+            message['sessionId'] = session
         try:
-            h = await request.all_headers()
-            self.registrar("cabecalhos_requisicao", requisicao_id=rid,
-                cookie_presente=bool(h.get("cookie")),
-                authorization_presente=bool(h.get("authorization")),
-                csrf_presente=any(k in h for k in ("x-csrf-token", "x-xsrf-token", "csrf-token")),
-                referer=self.sanitizador.url(h["referer"]) if h.get("referer") else None,
-                range=intervalo(h.get("range")))
-        except PlaywrightErro:
-            self.registrar("cabecalhos_indisponiveis", requisicao_id=rid)
-
-    def resposta(self, response):
-        if not self.rede_ativa:
-            return
-        request = response.request
-        if request not in self.requisicoes:
-            self.requisicao(request)
-        h = response.headers
-        encoding = h.get("content-encoding", "").strip().lower()
-        disposition = h.get("content-disposition", "").split(";", 1)[0].strip().lower()
-        dados = {"requisicao_id": self.requisicoes.get(request),
-                 "status": response.status, "content_type": mime(h.get("content-type")),
-                 "content_length": numero(h.get("content-length")),
-                 "content_range": intervalo(h.get("content-range")),
-                 "tem_content_range": bool(h.get("content-range")),
-                 "content_encoding": encoding if encoding in {"", "identity", "gzip", "br", "deflate", "zstd"} else "outro",
-                 "disposition": disposition if disposition in {"inline", "attachment"} else "ausente_ou_outro",
-                 "via_service_worker": bool(response.from_service_worker)}
-        if len(self.respostas) < 10000 or response.url in self.respostas:
-            self.respostas[response.url] = dados
-        if dados["requisicao_id"]:
-            self.respostas_por_id[dados["requisicao_id"]] = dados
-        self.registrar("resposta",
-                       endereco=self.sanitizador.url(response.url),
-                       location=self.sanitizador.url(urljoin(response.url, h["location"])) if h.get("location") else None,
-                       **dados)
-
-    async def concluida(self, request):
-        rid = self.requisicoes.get(request)
-        if not rid:
-            return
-        try:
-            tamanho = (await request.sizes()).get("responseBodySize")
-        except PlaywrightErro:
-            tamanho = None
-        self.registrar("requisicao_concluida", requisicao_id=rid, bytes_codificados=tamanho)
-
-    def falhou(self, request):
-        if not self.rede_ativa:
-            return
-        failure = request.failure or ""
-        codigo = failure if re.fullmatch(r"net::ERR_[A-Z_0-9]+", failure) else "omitido"
-        self.registrar("requisicao_falhou", requisicao_id=self.requisicoes.get(request), codigo=codigo)
-
-    def receber_download(self, download):
-        self.contagens["downloads_recebidos"] += 1
-        did = self.contagens["downloads_recebidos"]
-        self.registrar("download_iniciado", download_id=did, pagina_id=self.pagina_id(download.page),
-                       endereco=self.sanitizador.url(download.url))
-        self.ultimo_download = time.monotonic()
-        if not self.aceitar_downloads or did > 5:
-            self.registrar("download_recusado", download_id=did, motivo="limite_ou_encerramento")
-            self.tarefa(download.cancel())
-            return
-        # Fixar o request no instante do evento. Uma nova consulta ADF ao mesmo
-        # URL nao pode substituir os cabecalhos deste download enquanto ele baixa.
-        requisicao_id = self.ultimas_requisicoes.get(download.url)
-        self.tarefa(self.preservar(download, did, requisicao_id), self.transferencias)
-
-    async def preservar(self, download, did, requisicao_id=None):
-        parte = self.pasta / f"documento_{did:03d}.part"
-        final = self.pasta / f"documento_{did:03d}.pdf"
-        self.partes.add(parte)
-        resultado = {"download_id": did, "ok": False, "motivo": "nao_concluido",
-                     "http": None, "bytes": None, "paginas": None, "sha256": None}
-        copia = asyncio.create_task(download.save_as(parte))
-        self.copias.add(copia)
-        copia.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
-        tarefa_validacao = None
-        try:
-            # wait nao cancela a chamada Playwright em andamento por timeout e
-            # nao deixa futures intermediarios de shield imprimirem erros brutos.
-            concluidas, _ = await asyncio.wait({copia}, timeout=self.timeout_download)
-            if not concluidas:
-                raise asyncio.TimeoutError
-            copia.result()
-            falha = await asyncio.wait_for(download.failure(), 15)
-            if falha:
-                raise DocumentoInvalido("DOWNLOAD_NATIVO_FALHOU")
-            # Dar uma volta ao dispatcher para receber cabecalhos ja emitidos.
-            await asyncio.sleep(0)
-            http = self.respostas_por_id.get(requisicao_id)
-            resultado["http"] = http
-            if http:
-                if http["status"] in {401, 403}:
-                    raise DocumentoInvalido("HTTP_AUTENTICACAO_NEGADA")
-                if http["status"] >= 400:
-                    raise DocumentoInvalido("HTTP_ERRO")
-                if http["status"] == 206 or http["tem_content_range"]:
-                    raise DocumentoInvalido("HTTP_PARCIAL_REQUER_INVESTIGACAO")
-                if http["content_type"] in {"text/html", "application/json", "text/json", "application/xml", "text/xml"}:
-                    raise DocumentoInvalido("HTTP_NAO_PDF")
-                if http["content_length"] is not None and http["content_encoding"] in {"", "identity"}:
-                    if parte.stat().st_size != http["content_length"]:
-                        raise DocumentoInvalido("TAMANHO_HTTP_DIVERGENTE")
-            if final.exists():
-                raise DocumentoInvalido("DESTINO_JA_EXISTE")
-            with parte.open("r+b") as handle:
-                handle.flush()
-                os.fsync(handle.fileno())
-            async def validar_em_fila():
-                # O logger pypdf e global; serializar validacoes evita misturar
-                # avisos de dois documentos, mantendo a tarefa viva no cleanup.
-                async with self.trava_validacao:
-                    return await asyncio.to_thread(validar_pdf, parte, self.paginas_esperadas)
-
-            tarefa_validacao = asyncio.create_task(validar_em_fila())
-            self.validacoes.add(tarefa_validacao)
-            await asyncio.wait({tarefa_validacao})
-            validacao = tarefa_validacao.result()
-            self.validacoes.discard(tarefa_validacao)
-            # Mesmo diretorio/volume: promover somente depois de concluir e validar.
-            os.replace(parte, final)
-            self.partes.discard(parte)
-            resultado.update(validacao, ok=True, motivo="PDF_ESTRUTURA_VALIDADA", arquivo=final.name)
-            print(f"PDF salvo e validado: {final.name}; paginas={validacao['paginas']}; bytes={validacao['bytes']}", flush=True)
-        except asyncio.TimeoutError:
-            resultado["motivo"] = "TIMEOUT_DOWNLOAD"
-            with suppress(PlaywrightErro, asyncio.TimeoutError):
-                await asyncio.wait_for(download.cancel(), 10)
-            with suppress(Exception):
-                concluidas, _ = await asyncio.wait({copia}, timeout=10)
-                if concluidas:
-                    copia.result()
-        except DocumentoInvalido as erro:
-            # As mensagens desta classe sao codigos fixos, nunca valores do PDF.
-            resultado["motivo"] = str(erro)
-        except PlaywrightErro as erro:
-            texto = str(erro)
-            codigo = re.search(r"\bnet::ERR_[A-Z_0-9]+\b", texto)
-            resultado["motivo"] = (codigo.group(0) if codigo else
-                "DOWNLOAD_CANCELADO" if "canceled" in texto.lower() or "cancelled" in texto.lower()
-                else "DOWNLOAD_NATIVO_FALHOU")
-        except OSError as erro:
-            resultado["motivo"] = f"FALHA_DISCO_ERRNO_{erro.errno}"
-        except asyncio.CancelledError:
-            resultado["motivo"] = "INTERROMPIDO"
-            with suppress(PlaywrightErro, asyncio.TimeoutError):
-                await asyncio.wait_for(download.cancel(), 5)
-            raise
-        except Exception as erro:
-            resultado["motivo"] = "FALHA_LOCAL_" + type(erro).__name__
+            await self.ws.send(json.dumps(message))
+            return await asyncio.wait_for(future, timeout)
         finally:
-            if copia.done():
-                self.copias.discard(copia)
-                if not copia.cancelled():
-                    # Recuperar a excecao sem imprimir texto ou traceback.
-                    copia.exception()
-                if not resultado["ok"] and (tarefa_validacao is None or tarefa_validacao.done()):
-                    with suppress(OSError):
-                        parte.unlink(missing_ok=True)
-                    if not parte.exists():
-                        self.partes.discard(parte)
-            self.resultados.append(resultado)
-            self.registrar("download_resultado", **resultado)
+            self.futuros.pop(identificador, None)
+            self.sessoes_futuras.pop(identificador, None)
 
-    async def aguardar(self, browser, espera):
-        limite = time.monotonic() + espera
-        proximo_aviso = 0
-        while browser.is_connected() and self.context.pages:
-            agora = time.monotonic()
-            # Um download iniciado dentro do prazo pode terminar depois dele.
-            if agora >= limite and not self.transferencias:
-                return "PRAZO_OBSERVACAO"
-            if self.resultados and not self.transferencias and agora - self.ultimo_download >= 2:
-                return "DOWNLOAD_PROCESSADO"
-            if agora >= proximo_aviso:
-                print(f"Observando: respostas={self.contagens['resposta']}; downloads={self.contagens['downloads_recebidos']}. "
-                      "Login, token e navegacao sao manuais neste diagnostico.", flush=True)
-                proximo_aviso = agora + 30
-            await asyncio.sleep(0.2)
-        # O usuario pode ter fechado a pagina que iniciou a transferencia.
-        if self.transferencias:
-            await asyncio.gather(*list(self.transferencias), return_exceptions=True)
-        return "NAVEGADOR_FECHADO"
+    async def instalar(self, endpoint):
+        # Endpoint criado exclusivamente pelo perfil temporario deste processo.
+        # Conexao local sem proxy. O endpoint e os headers nunca sao registrados.
+        self.ws = await connect(endpoint, proxy=None, compression=None,
+            max_size=4 * 1024 * 1024, max_queue=16, open_timeout=10, close_timeout=5)
+        self.leitor = asyncio.create_task(self.receber())
+        await self.comando('Target.setAutoAttach', {'autoAttach': True,
+            'waitForDebuggerOnStart': True, 'flatten': True,
+            'filter': [{'type': 'page', 'exclude': False},
+                       {'type': 'iframe', 'exclude': False}, {'exclude': True}]})
+        for _ in range(100):
+            if self.sessoes:
+                break
+            await asyncio.sleep(.02)
+        if self.tarefas:
+            await asyncio.gather(*list(self.tarefas), return_exceptions=True)
+        if not self.sessoes:
+            raise ProtocoloErro('CAPTURA_SEM_ALVO_PRONTO')
+        self.monitor.registrar('captura_original_instalada', sessoes=len(self.sessoes))
 
-    async def encerrar(self, browser):
-        self.aceitar_downloads = False
-        self.rede_ativa = False
-        for task in list(self.transferencias):
-            task.cancel()
-        if self.transferencias:
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(asyncio.gather(*list(self.transferencias), return_exceptions=True), 20)
-        if browser is not None:
-            with suppress(PlaywrightErro, asyncio.TimeoutError):
-                await asyncio.wait_for(browser.close(), 20)
-        if self.copias:
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(asyncio.gather(*list(self.copias), return_exceptions=True), 5)
-        # Cancelar to_thread nao para o parser. Esperar terminar antes de apagar
-        # qualquer arquivo que ele possa ainda estar lendo, especialmente Windows.
-        if self.validacoes:
-            await asyncio.gather(*list(self.validacoes), return_exceptions=True)
-            self.validacoes.clear()
-        # Limpar parciais somente depois de encerrar as gravacoes do navegador.
-        for parte in self.partes:
-            with suppress(OSError):
-                parte.unlink(missing_ok=True)
-        for task in list(self.tarefas):
-            if not task.done():
-                task.cancel()
+    async def configurar_alvo(self, session, target):
+        try:
+            # Todas as respostas sao observadas, pois a classificacao pode ser
+            # feita somente apos receber Content-Type. O corpo nunca e lido.
+            await self.comando('Fetch.enable', {'patterns': [
+                {'urlPattern': '*', 'requestStage': 'Response'}]}, session)
+            await self.comando('Target.setAutoAttach', {'autoAttach': True,
+                'waitForDebuggerOnStart': True, 'flatten': True,
+                'filter': [{'type': 'iframe', 'exclude': False}, {'exclude': True}]}, session)
+            self.sessoes.add(session)
+            self.monitor.registrar('captura_alvo_pronta', numero=len(self.sessoes),
+                tipo=target.get('type') if target.get('type') in {'page', 'iframe'} else 'outro')
+        except Exception as erro:
+            self.monitor.registrar('captura_alvo_indisponivel', classe=type(erro).__name__)
+        finally:
+            with suppress(Exception):
+                await self.comando('Runtime.runIfWaitingForDebugger', session=session)
+
+    async def receber(self):
+        try:
+            async for raw in self.ws:
+                message = json.loads(raw)
+                if 'id' in message:
+                    future = self.futuros.get(message['id'])
+                    if future is not None and not future.done():
+                        if 'error' in message:
+                            future.set_exception(ProtocoloErro('COMANDO_CDP_INDISPONIVEL'))
+                        else:
+                            future.set_result(message.get('result', {}))
+                    continue
+                method = message.get('method')
+                params = message.get('params', {})
+                if method == 'Target.attachedToTarget':
+                    target = params.get('targetInfo', {})
+                    session = params['sessionId']
+                    if target.get('targetId') in self.alvos or self.fechando:
+                        self.tarefa(self.comando('Runtime.runIfWaitingForDebugger', session=session))
+                    else:
+                        self.alvos.add(target.get('targetId'))
+                        self.alvos_por_sessao[session] = target.get('targetId')
+                        self.tarefa(self.configurar_alvo(session, target))
+                elif method == 'Target.detachedFromTarget':
+                    detached = params.get('sessionId')
+                    self.sessoes.discard(detached)
+                    alvo_removido = self.alvos_por_sessao.pop(detached, None)
+                    if alvo_removido is not None:
+                        self.alvos.discard(alvo_removido)
+                    for identificador, sid in list(self.sessoes_futuras.items()):
+                        future = self.futuros.get(identificador)
+                        if sid == detached and future is not None and not future.done():
+                            future.set_exception(ProtocoloErro('ALVO_CDP_FECHADO'))
+                elif method == 'Fetch.requestPaused':
+                    self.tarefa(self.resposta(message.get('sessionId'), params))
+        except Exception as erro:
+            if not self.fechando:
+                self.monitor.registrar('canal_captura_falhou', classe=type(erro).__name__)
+        finally:
+            for future in list(self.futuros.values()):
+                if not future.done():
+                    future.set_exception(ProtocoloErro('CANAL_CDP_FECHADO'))
+
+    async def resposta(self, session, params):
+        request_id = params['requestId']
+        headers = params.get('responseHeaders') or []
+        tipo = next((str(item.get('value', '')).split(';', 1)[0].strip().lower()
+            for item in headers if str(item.get('name', '')).lower() == 'content-type'), '')
+        status = params.get('responseStatusCode')
+        alterar = (self.ativo and not self.fechando and status == 200
+                   and tipo == 'application/pdf'
+                   and not any(str(item.get('name', '')).lower() == 'content-range'
+                               for item in headers))
+        if alterar:
+            self.candidatos += 1
+            nome_local = f'sbk_original_{self.candidatos:04d}.pdf'
+            associar = getattr(self.monitor, 'associar_http_download', None)
+            if associar is not None:
+                h = {str(item.get('name', '')).lower(): str(item.get('value', '')) for item in headers}
+                associar(nome_local, {'requisicao_id': f'C{self.candidatos:04d}',
+                    'status': status, 'content_type': 'application/pdf',
+                    'content_length': numero(h.get('content-length')),
+                    'content_encoding': h.get('content-encoding', '').strip().lower() if h.get('content-encoding', '').strip().lower() in {'', 'identity', 'gzip', 'br', 'deflate', 'zstd'} else 'outro',
+                    'tem_content_range': False, 'disposition': 'attachment',
+                    'origem_metadados': 'resposta_original_antes_visualizador'})
+            novos_headers = [item for item in headers
+                if str(item.get('name', '')).lower() != 'content-disposition']
+            novos_headers.append({'name': 'Content-Disposition',
+                                  'value': f'attachment; filename="{nome_local}"'})
+            try:
+                await self.comando('Fetch.continueResponse', {'requestId': request_id,
+                    'responseCode': status, 'responseHeaders': novos_headers}, session)
+                self.ajustados += 1
+                self.monitor.registrar('cabecalho_download_ajustado', numero=self.ajustados,
+                    status=status, content_type='application/pdf', corpo_alterado=False,
+                    requisicao_repetida=False)
+                return
+            except Exception as erro:
+                self.monitor.registrar('cabecalho_download_nao_ajustado', classe=type(erro).__name__)
+        # Inclusive respostas ADF/HTML, erros e falhas do comando experimental.
+        # continueRequest na fase Response preserva corpo e cabecalhos recebidos.
+        with suppress(Exception):
+            await self.comando('Fetch.continueRequest', {'requestId': request_id}, session)
+
+    async def fechar(self):
+        self.fechando = True
+        self.ativo = False
+        if self.tarefas:
+            await asyncio.gather(*list(self.tarefas), return_exceptions=True)
+        if self.ws:
+            for session in list(self.sessoes):
+                with suppress(Exception):
+                    await self.comando('Fetch.disable', session=session, timeout=5)
+            with suppress(Exception):
+                await self.comando('Target.setAutoAttach', {'autoAttach': False,
+                    'waitForDebuggerOnStart': False, 'flatten': True}, timeout=5)
+            await self.ws.close()
+        if self.leitor:
+            with suppress(Exception):
+                await self.leitor
         if self.tarefas:
             await asyncio.gather(*list(self.tarefas), return_exceptions=True)
 
-    def resumo(self):
-        escolhido = next((r for r in self.resultados if r["ok"]),
-                         self.resultados[-1] if self.resultados else {})
-        http = escolhido.get("http") or {}
-        linhas = ["DIAGNOSTICO_SBK_V2",
-            "MODO=MANUAL; CAPTURA=DESDE_INICIO",
-            f"ENCERRAMENTO={self.motivo}",
-            f"PAGINAS_NAVEGADOR={len(self.paginas)}; RESPOSTAS_HTTP={self.contagens['resposta']}",
-            f"DOWNLOADS_INICIADOS={self.contagens['downloads_recebidos']}",
-            f"HTTP_DOWNLOAD={http.get('status', 'NAO_OBSERVADO')}",
-            f"MIME_DOWNLOAD={http.get('content_type', 'NAO_OBSERVADO')}",
-            f"CONTENT_LENGTH={http.get('content_length')}",
-            f"RESULTADO={escolhido.get('motivo', 'NENHUM_DOWNLOAD')}",
-            f"PDF_VALIDADO_ESTRUTURA={'SIM' if escolhido.get('ok') else 'NAO'}",
-            f"BYTES={escolhido.get('bytes')}; PAGINAS_PDF={escolhido.get('paginas')}",
-            f"PAGINAS_ESPERADAS={self.paginas_esperadas}",
-            f"SHA256={escolhido.get('sha256')}",
-            f"ARQUIVO={escolhido.get('arquivo', 'NAO_SALVO')}",
-            f"PARCIAIS_RESTANTES={sum(p.exists() for p in self.partes)}",
-            "SEM_REQUISICAO_EXTRA; SEM_IMPRESSAO; SEM_RECONSTRUCAO"]
-        texto = "\n".join(linhas) + "\n"
-        (self.pasta / "resumo.txt").write_text(texto, encoding="utf-8")
-        print("\n" + texto, flush=True)
-        self.registrar("fim", motivo=self.motivo, resultados=self.resultados)
-        self.fechado = True
-        self.log.close()
-        return any(r["ok"] for r in self.resultados)
+"""Controller SYNC para CapturaOriginal: Playwright fica na thread principal.
+
+Montagem: este helper usa CapturaOriginal definido antes dele no mesmo modulo.
+Imports necessarios: asyncio, concurrent.futures, json, re, threading, time,
+Path, suppress e connect (websockets.asyncio.client).
+
+Contrato de monitor: registrar(evento, **dados), opcionalmente
+associar_http_download(nome, metadados). Estes metodos e seus consumidores na
+thread principal devem usar o mesmo RLock monitor.trava_threads. O proxy abaixo
+protege todas as chamadas feitas pela thread CDP. Nenhum objeto Playwright e
+usado ou armazenado nessa thread.
+"""
 
 
-async def executar_manual(config, monitor, espera):
-    async with async_playwright() as p:
-        browser = None
+class CapturaInicializacaoErro(RuntimeError):
+    pass
+
+
+class _MonitorDaCaptura:
+    def __init__(self, monitor, trava):
+        self._monitor = monitor
+        self._trava = trava
+
+    def registrar(self, evento, **dados):
+        with self._trava:
+            self._monitor.registrar(evento, **dados)
+
+    def associar_http_download(self, nome, metadados):
+        with self._trava:
+            associar = getattr(self._monitor, 'associar_http_download', None)
+            if associar is not None:
+                associar(nome, metadados)
+
+
+class CapturaEmSegundoPlano:
+    """Loop CDP independente, inclusive durante Tk.mainloop e save_as SYNC."""
+    def __init__(self, monitor):
+        trava = getattr(monitor, 'trava_threads', None)
+        if trava is None:
+            trava = threading.RLock()
+            monitor.trava_threads = trava
+        self.monitor = _MonitorDaCaptura(monitor, trava)
+        self.pronta = threading.Event()
+        self._expirou = threading.Event()
+        self._thread = None
+        self._loop = None
+        self._sair = None
+        self._captura = None
+        self._watchdog = None
+        self._erro = None
+        self._fechada = False
+
+    @property
+    def expirou(self):
+        return self._expirou.is_set()
+
+    @staticmethod
+    def descobrir_endpoint(browser):
+        # Metodo chamado somente pela thread principal. O perfil e o endpoint
+        # pertencem ao Browser recebido; nao procura navegadores do usuario.
+        sessao = None
         try:
-            browser = await p.chromium.launch(channel="msedge", headless=False,
-                args=["--disable-popup-blocking", "--allow-popups-during-page-unload"])
-            monitor.registrar("ambiente", versao_script="2.0", python=sys.version.split()[0],
-                              playwright=version("playwright"), navegador=browser.version,
-                              tls_verificado=True, interceptacao=False)
-            context = await browser.new_context(accept_downloads=True)
-            monitor.instalar(context)
-            page = await context.new_page()
-            print("MODO MANUAL: faca login, informe o token no site e navegue ate Exportar.", flush=True)
-            print("O programa captura o download do navegador; nao executa cliques neste modo.", flush=True)
-            try:
-                await page.goto(config["URL_SBK"], wait_until="domcontentloaded", timeout=60000)
-            except PlaywrightErro as erro:
-                monitor.registrar("navegacao_inicial_incompleta", classe=type(erro).__name__)
-                print("A navegacao inicial nao concluiu no prazo. A observacao continua no navegador aberto.", flush=True)
-            print("Exporte uma unica vez. Se o PDF apenas aparecer, use o botao Baixar do visualizador uma vez.", flush=True)
-            print("Aguarde a mensagem PDF salvo e validado. Evite Ctrl+C durante a transferencia.", flush=True)
-            monitor.motivo = await monitor.aguardar(browser, espera)
-        except asyncio.CancelledError:
-            monitor.motivo = "INTERROMPIDO_MANUALMENTE"
-        except Exception as erro:
-            monitor.motivo = "FALHA_" + type(erro).__name__
-            monitor.registrar("falha", classe=type(erro).__name__)
+            sessao = browser.new_browser_cdp_session()
+            argumentos = sessao.send('Browser.getBrowserCommandLine')['arguments']
+            perfis = []
+            for indice, argumento in enumerate(argumentos):
+                if argumento.startswith('--user-data-dir='):
+                    perfis.append(argumento.split('=', 1)[1])
+                elif argumento == '--user-data-dir' and indice + 1 < len(argumentos):
+                    perfis.append(argumentos[indice + 1])
+            if len(perfis) != 1:
+                raise ValueError('PERFIL_NAO_IDENTIFICADO')
+            linhas = (Path(perfis[0]) / 'DevToolsActivePort').read_text(encoding='utf-8').splitlines()
+            if len(linhas) < 2:
+                raise ValueError('ENDPOINT_INCOMPLETO')
+            porta, caminho = linhas[:2]
+            if not porta.isdecimal() or not 1 <= int(porta) <= 65535:
+                raise ValueError('PORTA_INVALIDA')
+            if not re.fullmatch(r'/devtools/browser/[A-Za-z0-9-]+', caminho):
+                raise ValueError('CAMINHO_CDP_INVALIDO')
+            return f'ws://127.0.0.1:{int(porta)}{caminho}'
+        except Exception:
+            raise CapturaInicializacaoErro(
+                'Nao foi possivel preparar a captura local do navegador iniciado. '
+                'Confira as duas flags remote-debugging e se o Edge permite depuracao local.'
+            ) from None
         finally:
-            await monitor.encerrar(browser)
+            if sessao is not None:
+                with suppress(Exception):
+                    sessao.detach()
+
+    def iniciar(self, browser):
+        # Chamar apos context.new_page(), antes de navegar ou exportar.
+        if self._thread is not None:
+            raise CapturaInicializacaoErro('A captura ja foi iniciada.')
+        endpoint = self.descobrir_endpoint(browser)
+        self._thread = threading.Thread(target=self._rodar,
+            args=(endpoint,), name='sbk-cdp-local', daemon=True)
+        self._thread.start()
+        if not self.pronta.wait(35):
+            self.fechar()
+            raise CapturaInicializacaoErro('A captura local nao ficou pronta no prazo de 35 segundos.')
+        if self._erro is not None:
+            self.fechar()
+            raise CapturaInicializacaoErro(
+                'A captura local nao foi instalada; consulte o evento captura_thread_falhou.'
+            ) from None
+
+    def _rodar(self, endpoint):
+        try:
+            asyncio.run(self._executar(endpoint))
+        except Exception as erro:
+            self._erro = type(erro).__name__
+            self.monitor.registrar('captura_thread_falhou', classe=self._erro)
+        finally:
+            self.pronta.set()
+
+    async def _executar(self, endpoint):
+        self._loop = asyncio.get_running_loop()
+        self._sair = asyncio.Event()
+        self._captura = CapturaOriginal(self.monitor)
+        try:
+            await self._captura.instalar(endpoint)
+            self.pronta.set()
+            await self._sair.wait()
+        finally:
+            await self._cancelar_prazo_async()
+            try:
+                await asyncio.wait_for(self._captura.fechar(), 20)
+            except Exception:
+                if self._captura.ws is not None:
+                    with suppress(Exception):
+                        await self._captura.ws.close()
+
+    def _chamar(self, coroutine, timeout=10):
+        if self._loop is None or self._thread is None or not self._thread.is_alive() or self._fechada:
+            coroutine.close()
+            raise CapturaInicializacaoErro('A captura local nao esta disponivel.')
+        futuro = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        try:
+            return futuro.result(timeout)
+        except concurrent.futures.TimeoutError:
+            futuro.cancel()
+            raise CapturaInicializacaoErro('A captura local nao confirmou a operacao no prazo.') from None
+
+    async def _armar_async(self):
+        self._captura.ativo = True
+        self.monitor.registrar('captura_original_armada')
+
+    def armar(self):
+        self._chamar(self._armar_async())
+
+    async def _cancelar_prazo_async(self):
+        tarefa = self._watchdog
+        self._watchdog = None
+        if tarefa is not None and tarefa is not asyncio.current_task():
+            tarefa.cancel()
+            with suppress(asyncio.CancelledError):
+                await tarefa
+
+    async def _iniciar_prazo_async(self, prazo_final):
+        await self._cancelar_prazo_async()
+        self._expirou.clear()
+        self._watchdog = asyncio.create_task(self._vigiar(prazo_final))
+
+    def iniciar_prazo(self, segundos):
+        if not isinstance(segundos, (int, float)) or segundos <= 0:
+            raise ValueError('O prazo da transferencia deve ser positivo.')
+        self._chamar(self._iniciar_prazo_async(time.monotonic() + segundos))
+
+    async def _vigiar(self, prazo_final):
+        await asyncio.sleep(max(0, prazo_final - time.monotonic()))
+        self._expirou.set()
+        self.monitor.registrar('prazo_download_excedido', acao='encerrar_navegador_da_automacao')
+        # Somente o browser proprio do endpoint descoberto em iniciar().
+        # Interrompe inclusive save_as bloqueante, sem chamar Playwright aqui.
+        with suppress(Exception):
+            await self._captura.comando('Browser.close', timeout=5)
+
+    def cancelar_prazo(self):
+        if self._thread is not None and self._thread.is_alive() and not self._fechada:
+            with suppress(Exception):
+                self._chamar(self._cancelar_prazo_async(), timeout=6)
+
+    def fechar(self):
+        if self._fechada:
+            return
+        self.cancelar_prazo()
+        self._fechada = True
+        if self._loop is not None and self._sair is not None:
+            with suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(self._sair.set)
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=30)
+            if self._thread.is_alive():
+                self.monitor.registrar('captura_thread_nao_encerrou_no_prazo')
+
+class ErroDownload(RuntimeError):
+    """Erro controlado, sem dados do documento ou credenciais."""
+
+
+class RegistroExecucao:
+    def __init__(self, pasta, paginas_esperadas=None):
+        self.pasta = Path(pasta)
+        self.pasta.mkdir(parents=True, exist_ok=True)
+        self.arquivo = (self.pasta / "eventos.jsonl").open("x", encoding="utf-8", buffering=1)
+        self.trava_threads = threading.RLock()
+        self.trava = self.trava_threads
+        self.http_por_nome = {}
+        self.disparos_download = deque()
+        self.resultado = {}
+        self.paginas_esperadas = paginas_esperadas
+        self.armado = False
+        self.fechado = False
+        self.inicio = time.monotonic()
+        self.contagens = Counter()
+        self.paginas = set()
+
+    def registrar(self, evento, **dados):
+        with self.trava_threads:
+            if self.fechado:
+                return
+            self.contagens[evento] += 1
+            self.arquivo.write(json.dumps({"segundos": round(time.monotonic() - self.inicio, 3),
+                "evento": evento, **dados}, ensure_ascii=True) + "\n")
+
+    def associar_http_download(self, nome, dados):
+        with self.trava_threads:
+            self.http_por_nome[nome] = dict(dados)
+
+    def instalar(self, context):
+        # Todas as chamadas Playwright, inclusive callbacks, ficam na thread
+        # principal. A thread auxiliar usa apenas CDP e metadados protegidos.
+        def nova_pagina(page):
+            if page in self.paginas:
+                return
+            self.paginas.add(page)
+            self.registrar("pagina_detectada", numero=len(self.paginas))
+
+            def download_iniciado(download):
+                with self.trava_threads:
+                    if self.armado:
+                        self.disparos_download.append(download)
+                        self.registrar("download_iniciado")
+
+            page.on("download", download_iniciado)
+
+        context.on("page", nova_pagina)
+        for page in context.pages:
+            nova_pagina(page)
+
+    def gravar_resumo(self):
+        with self.trava_threads:
+            r = self.resultado
+            h = r.get("http") or {}
+            linhas = ["SBK_APP2_CORRIGIDO",
+                "BASE=APP2; NAVEGACAO_E_TKINTER_ORIGINAIS",
+                f"DOWNLOADS_INICIADOS={self.contagens['download_iniciado']}",
+                f"RESPOSTAS_AJUSTADAS={self.contagens['cabecalho_download_ajustado']}",
+                f"RESULTADO={r.get('motivo', 'EXECUCAO_NAO_CONCLUIDA')}",
+                f"HTTP={h.get('status', 'NAO_OBSERVADO')}; MIME={h.get('content_type', 'NAO_OBSERVADO')}",
+                f"CLASSE_BYTES={r.get('classe_bytes', 'NAO_MEDIDA')}; OFFSET_PDF={r.get('offset_assinatura')}",
+                f"PDF_VALIDADO_ESTRUTURA={'SIM' if r.get('ok') else 'NAO'}",
+                f"BYTES={r.get('bytes')}; PAGINAS={r.get('paginas')}; ESPERADAS={self.paginas_esperadas}",
+                f"ARQUIVO={r.get('arquivo', 'NAO_SALVO')}",
+                f"PARCIAIS_RESTANTES={len(list(self.pasta.glob('*.part')))}"]
+            (self.pasta / "resumo.txt").write_text("\n".join(linhas) + "\n", encoding="utf-8")
+
+    def fechar(self):
+        with self.trava_threads:
+            if not self.fechado:
+                self.gravar_resumo()
+                self.fechado = True
+                self.arquivo.close()
+
+
+def baixar_pdf_original(page, context, monitor, captura, botao, timeout=1200):
+    """Um clique e um download nativo; nenhuma consulta adicional ao servlet."""
+    if timeout <= 0:
+        raise ValueError("Prazo de download deve ser positivo.")
+    parte = monitor.pasta / "documento.part"
+    destino = monitor.pasta / "documento.pdf"
+    r = {"ok": False, "motivo": "NAO_CONCLUIDO", "bytes": None, "paginas": None,
+         "sha256": None, "http": None, "classe_bytes": None, "offset_assinatura": None}
+    try:
+        if parte.exists() or destino.exists():
+            raise ErroDownload("DESTINO_JA_EXISTE")
+        monitor.armado = True
+        captura.armar()
+        botao.scroll_into_view_if_needed()
+        captura.iniciar_prazo(timeout)
+        prazo = time.monotonic() + timeout
+        monitor.registrar("exportacao_automatica_disparada")
+        # Nao aguardar navegacao aqui: a geracao e a transferencia possuem seu
+        # proprio prazo, e o resultado pode ser download direto ou pop-up.
+        botao.click(no_wait_after=True)
+        download = None
+        while time.monotonic() < prazo:
+            if captura.expirou:
+                raise ErroDownload("TIMEOUT_DOWNLOAD")
+            with monitor.trava_threads:
+                if monitor.disparos_download:
+                    download = monitor.disparos_download.popleft()
+                    break
+            # Pump da API SYNC: time.sleep impediria receber os eventos.
+            page.wait_for_timeout(200)
+        if download is None:
+            raise ErroDownload("TIMEOUT_AGUARDANDO_DOWNLOAD")
+        with monitor.trava_threads:
+            h = monitor.http_por_nome.get(download.suggested_filename)
+            r["http"] = dict(h) if h else None
+        print("Download original iniciado. Aguardando a transferencia terminar...")
+        # O navegador transfere para disco. O watchdog CDP fecha somente este
+        # Browser temporario se save_as ficar bloqueado alem do prazo.
+        download.save_as(parte)
+        if download.failure():
+            raise ErroDownload("DOWNLOAD_NATIVO_FALHOU")
+        captura.cancelar_prazo()
+        r.update(classificar_arquivo(parte))
+        if h:
+            if h["status"] in {401, 403}:
+                raise ErroDownload("HTTP_AUTENTICACAO_NEGADA")
+            if h["status"] != 200 or h.get("tem_content_range"):
+                raise ErroDownload("HTTP_NAO_INTEGRAL")
+            if h["content_type"] in {"text/html", "application/json", "text/json"}:
+                raise ErroDownload("HTTP_NAO_PDF")
+            if h.get("content_length") is not None and h.get("content_encoding", "") in {"", "identity"}:
+                if r["bytes"] != h["content_length"]:
+                    raise ErroDownload("TAMANHO_HTTP_DIVERGENTE")
+        with parte.open("r+b") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        r.update(validar_pdf(parte, monitor.paginas_esperadas))
+        os.replace(parte, destino)
+        r.update(ok=True, motivo="PDF_ORIGINAL_VALIDADO", arquivo=destino.name)
+        print(f"PDF original salvo e validado: {destino.name} | {r['paginas']} paginas | {r['bytes']} bytes")
+        return destino
+    except DocumentoInvalido as erro:
+        r["motivo"] = str(erro)
+        raise ErroDownload(r["motivo"]) from None
+    except ErroDownload as erro:
+        r["motivo"] = str(erro)
+        raise
+    except PlaywrightErro as erro:
+        if captura.expirou:
+            r["motivo"] = "TIMEOUT_DOWNLOAD"
+        else:
+            codigo = re.search(r"\bnet::ERR_[A-Z_0-9]+\b", str(erro))
+            r["motivo"] = codigo.group(0) if codigo else "DOWNLOAD_NATIVO_FALHOU"
+        raise ErroDownload(r["motivo"]) from None
+    except OSError as erro:
+        r["motivo"] = f"ERRO_DISCO_{erro.errno}"
+        raise ErroDownload(r["motivo"]) from None
+    except Exception as erro:
+        r["motivo"] = "FALHA_DOWNLOAD_" + type(erro).__name__
+        raise ErroDownload(r["motivo"]) from None
+    finally:
+        with suppress(Exception):
+            captura.cancelar_prazo()
+        if not r["ok"]:
+            # save_as ja terminou/falhou; nenhum escritor Python permanece ativo.
+            with suppress(OSError):
+                parte.unlink(missing_ok=True)
+        with monitor.trava_threads:
+            monitor.resultado = r
+        monitor.registrar("download_resultado", **r)
+        monitor.gravar_resumo()
+
+def solicitar_token():
+  token = {"valor": ""}
+
+  def confirmar():
+    token["valor"] = entrada.get().strip()
+    janela.destroy()
+
+  janela = tk.Tk()
+  janela.title("SBK - Dupla Autenticação")
+  janela.geometry("500x220")
+  janela.resizable(False, False)
+
+  titulo = tk.Label(
+      janela, text="Dupla Autenticação", font=("Segoe UI", 12, "bold")
+  )
+  titulo.pack(pady=(20, 10))
+
+  texto = tk.Label(
+      janela,
+      text="Digite o token recebido por e-mail para continuar.",
+      wraplength=450,
+  )
+  texto.pack()
+
+  entrada = ttk.Entry(janela, width=35, justify="center")
+  entrada.pack(pady=15)
+  entrada.focus()
+
+  ttk.Button(janela, text="Confirmar", command=confirmar).pack()
+  janela.bind("<Return>", lambda e: confirmar())
+  janela.mainloop()
+
+  return token["valor"]
+
+
+def fechar_browser_seguro(browser):
+  with suppress(Exception):
+    if browser.is_connected():
+      browser.close()
+
+
+def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=None):
+  if config is None:
+    config = configurar(Path(__file__).with_name(".env"))
+  URL_SBK = config["URL_SBK"]
+  ID_TESTE = config["ID_TESTE"]
+  pasta = Path(__file__).with_name(datetime.now().strftime("execucao_app2_%Y%m%d_%H%M%S_%f"))
+  with sync_playwright() as p, ExitStack() as recursos:
+    # Lançamento do navegador Chromium (Edge) com desativação de bloqueios de pop-ups
+    browser = p.chromium.launch(
+        channel="msedge",
+        headless=False,
+        args=[
+            "--disable-popup-blocking",
+            "--allow-popups-during-page-unload",
+            "--remote-debugging-port=0",
+            "--remote-debugging-address=127.0.0.1",
+        ],
+    )
+
+    recursos.callback(fechar_browser_seguro, browser)
+
+    # Configuração do contexto ideal para navegação legítima de frames no ADF
+    context = browser.new_context(
+        accept_downloads=True,
+        ignore_https_errors=False,
+    )
+
+    monitor = RegistroExecucao(pasta, paginas_esperadas)
+    recursos.callback(monitor.fechar)
+    monitor.instalar(context)
+    captura = CapturaEmSegundoPlano(monitor)
+    recursos.callback(captura.fechar)
+
+    page = context.new_page()
+    captura.iniciar(browser)
+
+    print("Abrindo SBK...")
+    page.goto(URL_SBK)
+
+    print("Realize o login normalmente.")
+    print("Aguardando tela de token...")
+    page.wait_for_selector("#duplaAutenticacao\\:\\:\\:content", timeout=120000)
+
+    print("Campo de token localizado.")
+    token = solicitar_token()
+
+    page.fill("#duplaAutenticacao\\:\\:\\:content", token)
+    print("Token preenchido.")
+
+    try:
+      page.locator("#b4 a").click()
+    except:
+      page.get_by_text("Autenticar").click()
+
+    print("Botão autenticar acionado.")
+    page.wait_for_load_state("networkidle")
+    print("Autenticação concluída.")
+
+    # ==========================================
+    # CONSULTA IMAGEM
+    # ==========================================
+    print("Abrindo Consulta Imagem...")
+    page.click("#pt1\\:pt_1ConsultaDeImagem\\:\\:text")
+    page.wait_for_timeout(5000)
+
+    page.wait_for_timeout(5000)
+
+    dialog_frame = None
+    for frame in page.frames:
+      if "adf.dialog-request" in frame.url:
+        dialog_frame = frame
+        break
+
+    if dialog_frame is None:
+      raise Exception(
+          "Não foi possível localizar o frame da Consulta Imagem."
+      )
+
+    print("Frame localizado com sucesso.")
+
+    # ==========================================
+    # TIPO DOCUMENTO
+    # ==========================================
+    print("Selecionando CONTABIL BRADESCO-189...")
+    dialog_frame.select_option(
+        "#pt1\\:socTipoDocumento\\:\\:\\:content",
+        label="CONTABIL BRADESCO-189",
+    )
+    dialog_frame.wait_for_timeout(2000)
+
+    # ==========================================
+    # CLIENTE
+    # ==========================================
+    print("Selecionando Cliente...")
+    dialog_frame.click("#pt1\\:\\:sorTipoPesquisa\\:\\:_1")
+    dialog_frame.wait_for_timeout(1000)
+
+    # ==========================================
+    # ID
+    # ==========================================
+    print("Preenchendo o ID configurado no .env...")
+    dialog_frame.fill("#pt1\\:\\:itTipoPesquisaItem\\:\\:\\:content", ID_TESTE)
+    dialog_frame.wait_for_timeout(1000)
+
+    # ==========================================
+    # PESQUISAR
+    # ==========================================
+    print("Clicando em Pesquisar Documento...")
+    dialog_frame.click("#pt1\\:\\:btPesquisarDocumento")
+    dialog_frame.wait_for_timeout(5000)
+    print("Pesquisa enviada.")
+
+    # ==========================================
+    # SELEÇÃO DOS FILTROS E CHECKBOXES (Continuação)
+    # ==========================================
+
+    # 1. Marcar o checkbox SelectAllDoc
+    print("Marcando a primeira checkbox (Selecionar Todos)...")
+    seletor_chk1 = "#pt1\\:\\:pc1\\:\\:t1\\:\\:sbcSelectAllDoc\\:\\:\\:content"
+    dialog_frame.wait_for_selector(seletor_chk1, timeout=15000)
+    dialog_frame.wait_for_timeout(2000)
+    dialog_frame.click(seletor_chk1)
+
+    # 2. Clique em Confirmar Filtro
+    print("Clicando em Confirmar Filtro...")
+    dialog_frame.wait_for_timeout(2000)
+    seletor_btn1 = "#pt1\\:\\:pc1\\:\\:btConfirmarFiltro > a"
+    dialog_frame.wait_for_selector(seletor_btn1, timeout=15000)
+    dialog_frame.click(seletor_btn1)
+
+    dialog_frame.wait_for_load_state("networkidle")
+
+    # 3. Marcar a outra checkbox SelectAllDocDet
+    print("Marcando a segunda checkbox (Selecionar Detalhes)...")
+    seletor_chk2 = (
+        "#pt1\\:\\:pcIPD\\:\\:t3\\:\\:sbcSelectAllDocDet\\:\\:\\:content"
+    )
+    dialog_frame.wait_for_selector(seletor_chk2, timeout=15000)
+    dialog_frame.wait_for_timeout(2000)
+    dialog_frame.click(seletor_chk2)
+
+    print("Aguardando o sistema processar a seleção das imagens...")
+    dialog_frame.wait_for_load_state("networkidle")
+    dialog_frame.wait_for_timeout(3000)
+
+    # ==========================================
+    # 4. DOWNLOAD ORIGINAL: apresentar como attachment antes do visualizador
+    # ==========================================
+    print("Aguardando botão Exportar Imagens estar totalmente pronto...")
+    seletor_btn2 = "#pt1\\:\\:pcIPD\\:\\:btDownloadImgSelect > a"
+    dialog_frame.wait_for_selector(seletor_btn2, timeout=15000)
+    dialog_frame.wait_for_timeout(3000)
+
+    nome_arquivo = monitor.pasta / "documento.pdf"
+    erro_download = None
+    try:
+      baixar_pdf_original(
+          page, context, monitor, captura, dialog_frame.locator(seletor_btn2),
+          timeout=timeout_download,
+      )
+      print(f"Arquivo validado: {nome_arquivo.name}")
+    except ErroDownload as erro:
+      erro_download = erro
+      print(f"Download nao concluido: {erro}")
+    finally:
+      captura.fechar()
+      monitor.gravar_resumo()
+
+    print(f"Resumo e resultado locais na pasta: {monitor.pasta.name}")
+    try:
+      input("\nPressione ENTER aqui para encerrar o Edge de testes...")
+    except EOFError:
+      pass
+    browser.close()
+    if erro_download is not None:
+      raise erro_download
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Diagnostico manual com preservacao e validacao do download nativo.")
-    parser.add_argument("--env", type=Path, default=Path(__file__).with_name(".env"))
-    parser.add_argument("--espera", type=int, default=900, help="Prazo para login/navegacao manual, em segundos.")
-    parser.add_argument("--timeout-download", type=int, default=1200, help="Prazo por transferencia, em segundos.")
-    parser.add_argument("--paginas-esperadas", type=int, default=None)
-    args = parser.parse_args()
-    if not 30 <= args.espera <= 7200 or not 10 <= args.timeout_download <= 7200:
-        parser.error("Use --espera entre 30 e 7200 e --timeout-download entre 10 e 7200.")
-    if args.paginas_esperadas is not None and args.paginas_esperadas <= 0:
-        parser.error("--paginas-esperadas deve ser um inteiro positivo.")
-    try:
-        config = configurar(args.env)
-    except ConfiguracaoErro as erro:
-        print("Configuracao: " + str(erro), file=sys.stderr)
-        return 2
-    pasta = Path(__file__).with_name(datetime.now().strftime("coleta_sbk_v2_%Y%m%d_%H%M%S_%f"))
-    try:
-        monitor = Monitor(pasta, args.timeout_download, args.paginas_esperadas)
-    except OSError:
-        print("Nao foi possivel criar a pasta de diagnostico; use uma pasta com permissao de escrita.", file=sys.stderr)
-        return 2
-    try:
-        asyncio.run(executar_manual(config, monitor, args.espera))
-    except KeyboardInterrupt:
-        monitor.motivo = "INTERROMPIDO_MANUALMENTE"
-    except Exception as erro:
-        monitor.motivo = "FALHA_INICIAL_" + type(erro).__name__
-        monitor.registrar("falha", classe=type(erro).__name__)
-    finally:
-        ok = monitor.resumo()
-    print(f"Pasta local: {pasta.name}. Para relatar o teste, transcreva somente resumo.txt.", flush=True)
-    return 0 if ok else 1
+  parser = argparse.ArgumentParser(description="App2 original com .env e download nativo validado.")
+  parser.add_argument("--env", type=Path, default=Path(__file__).with_name(".env"))
+  parser.add_argument("--timeout-download", type=int, default=1200)
+  parser.add_argument("--paginas-esperadas", type=int)
+  args = parser.parse_args()
+  if not 10 <= args.timeout_download <= 7200:
+    parser.error("--timeout-download deve estar entre 10 e 7200 segundos.")
+  if args.paginas_esperadas is not None and args.paginas_esperadas <= 0:
+    parser.error("--paginas-esperadas deve ser positivo.")
+  try:
+    config = configurar(args.env)
+    executar_automacao(config, args.timeout_download, args.paginas_esperadas)
+    return 0
+  except ConfiguracaoErro as erro:
+    print(f"Configuracao: {erro}", file=sys.stderr)
+    return 2
+  except ErroDownload as erro:
+    print(f"Falha: {erro}", file=sys.stderr)
+    return 1
+  except CapturaInicializacaoErro as erro:
+    print(f"Captura: {erro}", file=sys.stderr)
+    return 1
+  except KeyboardInterrupt:
+    print("Execucao interrompida pelo usuario.", file=sys.stderr)
+    return 1
+  except Exception as erro:
+    # Erros Playwright podem incluir URL, tokens ou valores preenchidos.
+    print(f"A automacao parou ({type(erro).__name__}). Confira a ultima etapa exibida e o resumo local.", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+  raise SystemExit(main())
