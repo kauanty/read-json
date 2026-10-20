@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import argparse
@@ -11,12 +10,14 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import ttk
 from urllib.parse import urlsplit
+from urllib.request import ProxyHandler, HTTPRedirectHandler, build_opener
 
 from dotenv import dotenv_values
 from playwright.sync_api import Error as PlaywrightErro, sync_playwright
@@ -366,12 +367,17 @@ class CapturaOriginal:
             self.futuros.pop(identificador, None)
             self.sessoes_futuras.pop(identificador, None)
 
-    async def instalar(self, endpoint):
+    async def instalar(self, endpoint, contextos_esperados=None):
         # Endpoint criado exclusivamente pelo perfil temporario deste processo.
         # Conexao local sem proxy. O endpoint e os headers nunca sao registrados.
         self.ws = await connect(endpoint, proxy=None, compression=None,
             max_size=4 * 1024 * 1024, max_queue=16, open_timeout=10, close_timeout=5)
         self.leitor = asyncio.create_task(self.receber())
+        # Verificar identidade antes de observar alvos ou alterar respostas.
+        if contextos_esperados is not None:
+            encontrados = set((await self.comando('Target.getBrowserContexts')).get('browserContextIds', []))
+            if not contextos_esperados or not set(contextos_esperados).issubset(encontrados):
+                raise ProtocoloErro('NAVEGADOR_LOCAL_DIVERGENTE')
         await self.comando('Target.setAutoAttach', {'autoAttach': True,
             'waitForDebuggerOnStart': True, 'flatten': True,
             'filter': [{'type': 'page', 'exclude': False},
@@ -541,9 +547,55 @@ class _MonitorDaCaptura:
                 associar(nome, metadados)
 
 
+def reservar_porta_local():
+    # O socket e liberado antes do launch. A identidade CDP e conferida depois
+    # para rejeitar outro processo que eventualmente ocupe esta porta.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as servidor:
+        servidor.bind(('127.0.0.1', 0))
+        return servidor.getsockname()[1]
+
+
+class _SemRedirecionamentoLocal(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def endpoint_na_porta_local(porta, timeout=6):
+    if isinstance(porta, bool) or not isinstance(porta, int) or not 1 <= porta <= 65535:
+        raise CapturaInicializacaoErro('CDP_PORTA_INVALIDA')
+    # Ignorar proxy corporativo apenas nesta consulta a 127.0.0.1.
+    # Nao alterar o proxy usado pelo Edge para acessar o SBK.
+    cliente = build_opener(ProxyHandler({}), _SemRedirecionamentoLocal())
+    prazo = time.monotonic() + timeout
+    ultimo = 'SEM_RESPOSTA'
+    while time.monotonic() < prazo:
+        try:
+            with cliente.open(f'http://127.0.0.1:{porta}/json/version',
+                              timeout=max(.05, min(1, prazo - time.monotonic()))) as resposta:
+                dados = resposta.read(65537)
+            if len(dados) > 65536:
+                raise ValueError('RESPOSTA_LOCAL_EXCESSIVA')
+            endpoint = json.loads(dados)['webSocketDebuggerUrl']
+            esperado = rf'ws://127\.0\.0\.1:{porta}/devtools/browser/[A-Za-z0-9-]+'
+            if not isinstance(endpoint, str) or not re.fullmatch(esperado, endpoint):
+                raise ValueError('ENDPOINT_LOCAL_INVALIDO')
+            return endpoint
+        except Exception as erro:
+            # Somente classe; mensagens podem conter caminhos/dados do ambiente.
+            ultimo = type(erro).__name__
+            time.sleep(min(.1, max(0, prazo - time.monotonic())))
+    raise CapturaInicializacaoErro(
+        'CDP_LOCAL_SEM_RESPOSTA (' + ultimo + '). O Edge iniciou, mas a conexao '
+        'local de captura nao ficou disponivel. Isso ainda nao confirma bloqueio '
+        'corporativo; se persistir, envie somente este codigo de erro.'
+    )
+
+
 class CapturaEmSegundoPlano:
     """Loop CDP independente, inclusive durante Tk.mainloop e save_as SYNC."""
-    def __init__(self, monitor):
+    def __init__(self, monitor, porta_cdp=None):
+        self._porta_cdp = porta_cdp
+        self._contextos_esperados = None
         trava = getattr(monitor, 'trava_threads', None)
         if trava is None:
             trava = threading.RLock()
@@ -602,7 +654,25 @@ class CapturaEmSegundoPlano:
         # Chamar apos context.new_page(), antes de navegar ou exportar.
         if self._thread is not None:
             raise CapturaInicializacaoErro('A captura ja foi iniciada.')
-        endpoint = self.descobrir_endpoint(browser)
+        if self._porta_cdp is None:
+            # Compatibilidade com chamadas antigas e fixtures locais.
+            endpoint = self.descobrir_endpoint(browser)
+        else:
+            sessao = None
+            try:
+                sessao = browser.new_browser_cdp_session()
+                self._contextos_esperados = set(sessao.send('Target.getBrowserContexts')['browserContextIds'])
+                if not self._contextos_esperados:
+                    raise ValueError('CONTEXTO_AUSENTE')
+            except Exception as erro:
+                raise CapturaInicializacaoErro(
+                    'CDP_IDENTIDADE_INDISPONIVEL (' + type(erro).__name__ + ')'
+                ) from None
+            finally:
+                if sessao is not None:
+                    with suppress(Exception):
+                        sessao.detach()
+            endpoint = endpoint_na_porta_local(self._porta_cdp)
         self._thread = threading.Thread(target=self._rodar,
             args=(endpoint,), name='sbk-cdp-local', daemon=True)
         self._thread.start()
@@ -612,14 +682,14 @@ class CapturaEmSegundoPlano:
         if self._erro is not None:
             self.fechar()
             raise CapturaInicializacaoErro(
-                'A captura local nao foi instalada; consulte o evento captura_thread_falhou.'
+                'CDP_CAPTURA_NAO_INSTALADA (' + self._erro + ').'
             ) from None
 
     def _rodar(self, endpoint):
         try:
             asyncio.run(self._executar(endpoint))
         except Exception as erro:
-            self._erro = type(erro).__name__
+            self._erro = (str(erro) if isinstance(erro, ProtocoloErro) else type(erro).__name__)
             self.monitor.registrar('captura_thread_falhou', classe=self._erro)
         finally:
             self.pronta.set()
@@ -629,7 +699,7 @@ class CapturaEmSegundoPlano:
         self._sair = asyncio.Event()
         self._captura = CapturaOriginal(self.monitor)
         try:
-            await self._captura.instalar(endpoint)
+            await self._captura.instalar(endpoint, self._contextos_esperados)
             self.pronta.set()
             await self._sair.wait()
         finally:
@@ -923,6 +993,7 @@ def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=Non
   ID_TESTE = config["ID_TESTE"]
   pasta = Path(__file__).with_name(datetime.now().strftime("execucao_app2_%Y%m%d_%H%M%S_%f"))
   with sync_playwright() as p, ExitStack() as recursos:
+    porta_cdp = reservar_porta_local()
     # Lançamento do navegador Chromium (Edge) com desativação de bloqueios de pop-ups
     browser = p.chromium.launch(
         channel="msedge",
@@ -930,7 +1001,7 @@ def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=Non
         args=[
             "--disable-popup-blocking",
             "--allow-popups-during-page-unload",
-            "--remote-debugging-port=0",
+            f"--remote-debugging-port={porta_cdp}",
             "--remote-debugging-address=127.0.0.1",
         ],
     )
@@ -946,10 +1017,11 @@ def executar_automacao(config=None, timeout_download=1200, paginas_esperadas=Non
     monitor = RegistroExecucao(pasta, paginas_esperadas)
     recursos.callback(monitor.fechar)
     monitor.instalar(context)
-    captura = CapturaEmSegundoPlano(monitor)
+    captura = CapturaEmSegundoPlano(monitor, porta_cdp=porta_cdp)
     recursos.callback(captura.fechar)
 
     page = context.new_page()
+    print("Captura local: revisao 2026-10-20 (conexao direta).")
     captura.iniciar(browser)
 
     print("Abrindo SBK...")
